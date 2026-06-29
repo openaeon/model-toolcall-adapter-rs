@@ -1101,6 +1101,12 @@ async fn handle_value(
     let external_model = request.model.clone();
     if let Some(upstream_model) = state.config.model_alias_map().get(request.model.trim()) {
         request.model = upstream_model.clone();
+    } else if should_route_to_default_deepseek_model(
+        &request.model,
+        &state.config.upstream_model,
+        &upstream_options,
+    ) {
+        request.model = state.config.upstream_model.clone();
     }
     tracing::info!("Mapped request model to={:?}", request.model);
     request.tools.truncate(state.config.max_tool_definitions);
@@ -1310,6 +1316,20 @@ fn push_sse(stream: &mut String, event: &str, data: Value) {
     stream.push_str("\n\n");
 }
 
+fn should_route_to_default_deepseek_model(
+    requested_model: &str,
+    upstream_model: &str,
+    upstream_options: &UpstreamRequestOptions,
+) -> bool {
+    upstream_model.starts_with("deepseek-web/")
+        && !requested_model.trim().starts_with("deepseek-web/")
+        && upstream_options
+            .provider
+            .as_deref()
+            .is_none_or(|provider| provider.eq_ignore_ascii_case("deepseek-web"))
+        && upstream_options.base_url.is_none()
+}
+
 fn restore_external_model(body: &mut Value, external_model: &str) {
     if !external_model.trim().is_empty() {
         body["model"] = Value::String(external_model.to_string());
@@ -1405,9 +1425,11 @@ mod tests {
 
     use super::{
         apply_tool_choice_to_tool_calls, codex_managed_provider_block, codex_managed_root_block,
-        find_deepseek_bearer, replace_codex_managed_blocks, upstream_options_from_headers,
+        find_deepseek_bearer, replace_codex_managed_blocks, should_route_to_default_deepseek_model,
+        upstream_options_from_headers,
     };
     use crate::types::{ParsedToolCall, ToolChoice, UnifiedRequest};
+    use crate::upstream::UpstreamRequestOptions;
 
     #[test]
     fn extracts_per_request_upstream_options() {
@@ -1501,5 +1523,21 @@ name = "MyOpenAI"
         let bearer = find_deepseek_bearer(&storage);
 
         assert_eq!(bearer.as_deref(), Some("login-token-64"));
+    }
+
+    #[test]
+    fn codex_model_names_route_to_selected_deepseek_upstream() {
+        let options = UpstreamRequestOptions::default();
+
+        assert!(should_route_to_default_deepseek_model(
+            "gpt-5.4-mini",
+            "deepseek-web/reasoner",
+            &options
+        ));
+        assert!(!should_route_to_default_deepseek_model(
+            "gpt-5.4-mini",
+            "qwen3-coder",
+            &options
+        ));
     }
 }

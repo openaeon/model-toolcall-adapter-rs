@@ -1150,6 +1150,7 @@ async fn handle_value(
                 let tool_calls = constrain_parallel_tool_calls(&request, tool_calls);
                 responses::function_call_items(&tool_calls)
             };
+            let output = prepend_reasoning_output(upstream_response.reasoning.as_deref(), output);
             let mut body = responses::response_from_output(&request, output, output_text);
             if let Some(session_id) = upstream_response.provider_session_id.as_deref() {
                 body["_adapter_provider_session_id"] = Value::String(session_id.to_string());
@@ -1305,6 +1306,8 @@ fn responses_streaming_sse(
                 } else {
                     (responses::function_call_items(&parsed_tool_calls), "")
                 };
+                let output =
+                    prepend_reasoning_output(upstream_response.reasoning.as_deref(), output);
                 let mut completed = responses::response_from_output(&request, output, output_text);
                 completed["id"] = shell_response["id"].clone();
                 completed["created_at"] = shell_response["created_at"].clone();
@@ -1318,12 +1321,10 @@ fn responses_streaming_sse(
                     .flatten()
                     .enumerate()
                 {
-                    let output_index = if upstream_response.reasoning.is_some() {
-                        index + 1
-                    } else {
-                        index
-                    };
-                    emit_output_item(&mut sink, output_index, item).await;
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        continue;
+                    }
+                    emit_output_item(&mut sink, index, item).await;
                 }
                 sink.send_event(
                     "response.completed",
@@ -1479,15 +1480,7 @@ async fn emit_output_item(sink: &mut SseSink, output_index: usize, item: &Value)
 }
 
 async fn emit_reasoning_item(sink: &mut SseSink, output_index: usize, reasoning: &str) {
-    let item = json!({
-        "id": format!("rs_{}", uuid::Uuid::new_v4()),
-        "type": "reasoning",
-        "status": "completed",
-        "summary": [{
-            "type": "summary_text",
-            "text": reasoning
-        }]
-    });
+    let item = responses::reasoning_output_item(reasoning);
     sink.send_event(
         "response.output_item.added",
         json!({
@@ -1546,6 +1539,14 @@ async fn emit_reasoning_item(sink: &mut SseSink, output_index: usize, reasoning:
         }),
     )
     .await;
+}
+
+fn prepend_reasoning_output(reasoning: Option<&str>, mut output: Vec<Value>) -> Vec<Value> {
+    let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty()) else {
+        return output;
+    };
+    output.insert(0, responses::reasoning_output_item(reasoning));
+    output
 }
 
 async fn emit_response_error(sink: &mut SseSink, mut response: Value, message: impl Into<String>) {

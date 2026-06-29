@@ -113,6 +113,18 @@ pub(crate) fn message_output_item(text: &str) -> Value {
     })
 }
 
+pub(crate) fn reasoning_output_item(reasoning: &str) -> Value {
+    json!({
+        "id": format!("rs_{}", Uuid::new_v4()),
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [{
+            "type": "summary_text",
+            "text": reasoning
+        }]
+    })
+}
+
 pub(crate) fn function_call_items(tool_calls: &[ParsedToolCall]) -> Vec<Value> {
     tool_calls
         .iter()
@@ -258,7 +270,7 @@ fn parse_content_part(part: &Value) -> Option<UnifiedContent> {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_request, response};
+    use super::{parse_request, reasoning_output_item, response};
     use crate::types::ParsedToolCall;
 
     #[test]
@@ -352,6 +364,14 @@ mod tests {
         assert_eq!(body["output"][0]["type"], "function_call");
         assert_eq!(body["output"][0]["status"], "completed");
         assert_eq!(body["output"][0]["call_id"], "call_a");
+    }
+
+    #[test]
+    fn emits_reasoning_as_separate_output_item() {
+        let item = reasoning_output_item("thinking only");
+
+        assert_eq!(item["type"], "reasoning");
+        assert_eq!(item["summary"][0]["text"], "thinking only");
     }
 
     #[test]

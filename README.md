@@ -21,6 +21,10 @@ The goal is practical compatibility with mainstream programming agents and edito
 - Includes a DeepSeek Web upstream provider with local session storage, PoW handling, SSE parsing, and reasoning/text separation.
 - Includes a setup wizard at `/ui` for provider selection, adapter key generation, DeepSeek Web login, and bridge configuration.
 
+## Screenshot
+
+![Setup wizard demo](docs/assets/setup-wizard.png)
+
 The project is now standalone. It does not depend on `../crates/aeon-claw-api`, `aeon-claw-cli`, or the FCACoreai workspace at build time or runtime.
 
 ## Compatibility Targets
@@ -363,22 +367,23 @@ The project is intentionally kept as a single standalone Rust binary crate.
 
 Implemented:
 
-- Non-streaming Chat Completions, Messages, and Responses compatibility.
+- Chat Completions, Messages, and Responses compatibility; Responses `stream: true` has a minimal SSE event wrapper.
 - Responses create, retrieve, input-items, cancel, and compact endpoints.
 - `previous_response_id` continuation.
 - Top-level Responses `function_call` output and `function_call_output` continuation.
+- Basic `tool_choice` semantics: `auto`, `none`, `required`, named function, and `parallel_tool_calls` trimming.
 - Model aliases.
 - Adapter API-key authentication.
 - Per-request upstream base URL and API-key overrides.
-- DeepSeek Web session save/read, PoW, completion, and text parsing.
+- DeepSeek Web controlled-browser login, cookie/localStorage capture, session save/read, PoW, completion, and text parsing.
+- One-click Codex setup: backup and write `~/.codex/config.toml` plus `auth.json` with Responses wire.
 - XML and tolerant JSON tool-call parsing.
 
 Not yet implemented:
 
-- Streaming output.
-- Full browser cookie extraction for DeepSeek Web login.
+- True incremental streaming for Chat Completions / Messages.
+- True upstream incremental forwarding for Responses; current behavior wraps the completed response as SSE events.
 - Durable response storage beyond process memory.
-- More complete `tool_choice` edge cases.
 
 ## License
 

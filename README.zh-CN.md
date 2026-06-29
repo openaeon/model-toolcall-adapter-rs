@@ -21,6 +21,10 @@
 - 内置 DeepSeek Web 上游 provider，支持本地 session 存储、PoW、SSE 解析、reasoning/text 分离。
 - 内置 `/ui` 启动向导，用于选择供应商、生成 adapter key、登录 DeepSeek Web 并展示桥接接口。
 
+## 截图演示
+
+![启动向导演示](docs/assets/setup-wizard.png)
+
 本项目是独立仓库。构建和运行时不依赖 `../crates/aeon-claw-api`、`aeon-claw-cli` 或 FCACoreai workspace。
 
 ## 兼容目标
@@ -363,22 +367,23 @@ cargo test
 
 已实现：
 
-- 非流式 Chat Completions、Messages、Responses 兼容。
+- Chat Completions、Messages、Responses 兼容；Responses `stream: true` 提供最小 SSE 事件包装。
 - Responses create、retrieve、input-items、cancel、compact 端点。
 - `previous_response_id` 多轮续接。
 - Responses 顶层 `function_call` 输出与 `function_call_output` 续接。
+- `tool_choice` 基础语义：`auto`、`none`、`required`、指定 function name，以及 `parallel_tool_calls` 裁剪。
 - 模型别名。
 - Adapter API key 鉴权。
 - 按请求覆盖上游 base URL 和 API key。
-- DeepSeek Web session 保存/读取、PoW、completion、文本解析。
+- DeepSeek Web 受控浏览器登录、Cookie/localStorage 捕获、session 保存/读取、PoW、completion、文本解析。
+- Codex 一键配置：备份并写入 `~/.codex/config.toml` 和 `auth.json`，使用 Responses wire。
 - XML 与容错 JSON 工具调用解析。
 
 暂未实现：
 
-- Streaming 输出。
-- DeepSeek Web 登录时自动提取浏览器 Cookie。
+- Chat Completions / Messages 的真实增量流式输出。
+- Responses 的真实上游增量转发；当前是完成后包装成 SSE 事件。
 - 进程内存之外的持久 response 存储。
-- 更完整的 `tool_choice` 边界情况。
 
 ## License
 

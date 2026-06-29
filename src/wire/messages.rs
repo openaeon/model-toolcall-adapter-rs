@@ -24,6 +24,11 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let tools = chat::parse_tools(payload.get("tools"));
+    let tool_choice = chat::parse_tool_choice(payload.get("tool_choice"));
+    let parallel_tool_calls = payload
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut messages = Vec::new();
 
     for message in payload
@@ -48,6 +53,8 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         system,
         messages,
         tools,
+        tool_choice,
+        parallel_tool_calls,
         stream,
         background: false,
         previous_response_id: None,

@@ -1,5 +1,8 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::process::Child;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use axum::routing::{get, post};
 use axum::Router;
@@ -17,6 +20,18 @@ pub struct AppState {
     pub config: AppConfig,
     pub upstream: OpenAiChatUpstream,
     pub responses: ResponseStore,
+    pub setup: Arc<Mutex<SetupState>>,
+}
+
+#[derive(Default)]
+pub struct SetupState {
+    pub deepseek_browser: Option<DeepSeekBrowserProcess>,
+}
+
+pub struct DeepSeekBrowserProcess {
+    pub port: u16,
+    pub user_data_dir: PathBuf,
+    pub child: Option<Child>,
 }
 
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
@@ -27,6 +42,7 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         config,
         upstream,
         responses,
+        setup: Arc::new(Mutex::new(SetupState::default())),
     });
 
     let app = Router::new()
@@ -38,7 +54,17 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
             "/deepseek-web/session",
             post(routes::deepseek_web_session_save),
         )
-        .route("/tools/market/overview", post(routes::market_overview))
+        .route("/setup/state", get(routes::setup_state))
+        .route("/setup/provider", post(routes::setup_provider))
+        .route(
+            "/setup/deepseek-browser/start",
+            post(routes::setup_deepseek_browser_start),
+        )
+        .route(
+            "/setup/deepseek-browser/capture",
+            post(routes::setup_deepseek_browser_capture),
+        )
+        .route("/setup/codex/apply", post(routes::setup_codex_apply))
         .route("/v1/models", get(routes::models))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/messages", post(routes::messages))

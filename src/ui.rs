@@ -3,230 +3,234 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Model Tool Call Adapter</title>
+  <title>Model Tool Call Adapter Setup</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0d1117;
-      --panel: #151b23;
-      --panel2: #0f1620;
-      --line: #30363d;
-      --text: #e6edf3;
-      --muted: #8b949e;
-      --accent: #2f81f7;
-      --ok: #3fb950;
-      --bad: #f85149;
+      --bg: #0b0f14;
+      --panel: #121820;
+      --panel2: #0f151d;
+      --line: #28313d;
+      --text: #eef4fb;
+      --muted: #9aa8b7;
+      --accent: #1f8a70;
+      --accent2: #4f7cff;
+      --ok: #42c77b;
+      --bad: #ff6b66;
+      --warn: #e6b85c;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
+      min-height: 100vh;
       background: var(--bg);
       color: var(--text);
-      font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 14px/1.48 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     main {
       min-height: 100vh;
       display: grid;
-      grid-template-columns: 360px minmax(0, 1fr);
+      grid-template-columns: 300px minmax(0, 1fr);
     }
     aside {
       border-right: 1px solid var(--line);
       background: var(--panel);
-      padding: 18px;
-      overflow: auto;
+      padding: 22px;
     }
     section {
-      padding: 18px;
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr) auto;
-      gap: 12px;
-      min-width: 0;
+      padding: 28px;
+      max-width: 980px;
+      width: 100%;
     }
-    h1 { font-size: 18px; margin: 0 0 4px; }
-    h2 { font-size: 13px; margin: 18px 0 8px; color: var(--muted); text-transform: uppercase; }
-    label { display: block; margin: 10px 0 5px; color: var(--muted); font-size: 12px; }
+    h1 { margin: 0 0 6px; font-size: 22px; }
+    h2 { margin: 0 0 12px; font-size: 18px; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    label { display: block; margin: 12px 0 6px; color: var(--muted); font-size: 12px; }
     input, select, textarea {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 6px;
       background: var(--panel2);
       color: var(--text);
-      padding: 9px 10px;
+      padding: 10px 11px;
       outline: none;
       font: inherit;
     }
     textarea {
-      min-height: 130px;
+      min-height: 120px;
       resize: vertical;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
     }
-    button {
+    pre {
+      overflow: auto;
       border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel2);
+      padding: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: #d8e5f2;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    button {
+      border: 1px solid transparent;
       border-radius: 6px;
       background: var(--accent);
       color: white;
-      padding: 9px 12px;
+      padding: 10px 13px;
       cursor: pointer;
-      font-weight: 650;
+      font-weight: 700;
     }
-    button.secondary { background: transparent; color: var(--text); }
+    button.secondary { background: transparent; border-color: var(--line); color: var(--text); }
+    button.blue { background: var(--accent2); }
     button:disabled { opacity: .55; cursor: not-allowed; }
-    .row { display: flex; gap: 8px; align-items: center; }
-    .row > * { flex: 1; }
-    .status { margin-top: 10px; min-height: 20px; color: var(--muted); font-size: 12px; }
-    .status.ok { color: var(--ok); }
-    .status.bad { color: var(--bad); }
-    .chat {
-      overflow: auto;
+    .steps { display: grid; gap: 10px; margin-top: 22px; }
+    .step-nav {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      color: var(--muted);
+      background: rgba(255,255,255,.02);
+    }
+    .step-nav.active { color: var(--text); border-color: var(--accent); background: rgba(31,138,112,.12); }
+    .step { display: none; }
+    .step.active { display: block; }
+    .panel {
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--panel);
-      padding: 12px;
-      min-height: 0;
+      padding: 18px;
+      margin-bottom: 14px;
     }
-    .msg {
-      border-bottom: 1px solid rgba(48,54,61,.65);
-      padding: 10px 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .msg:last-child { border-bottom: 0; }
-    .role { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
-    .tool {
-      margin-top: 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 8px;
-      background: #101820;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 12px;
-    }
-    .composer {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
-    }
-    .composer textarea { min-height: 72px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .status { min-height: 20px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+    .status.ok { color: var(--ok); }
+    .status.bad { color: var(--bad); }
+    .status.warn { color: var(--warn); }
+    .kv { display: grid; grid-template-columns: 160px minmax(0, 1fr); gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(40,49,61,.55); }
+    .kv:last-child { border-bottom: 0; }
+    .key { color: var(--muted); }
+    .value { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
     @media (max-width: 820px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
-      section { min-height: 65vh; }
+      section { padding: 18px; }
+      .grid { grid-template-columns: 1fr; }
+      .kv { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <main>
     <aside>
-      <h1>Tool Call Adapter</h1>
-      <div class="status">OpenAI Responses 标准工具调用调试台</div>
-
-      <h2>登录 / 模型</h2>
-      <label>Adapter API</label>
-      <input id="adapterUrl" value="http://127.0.0.1:8787" />
-      <label>Adapter API Key</label>
-      <input id="adapterKey" type="password" placeholder="本地测试通常填 local-dev-key；若 ADAPTER_API_KEY 为空可不填" />
-      <label>上游类型</label>
-      <select id="providerSelect">
-        <option value="openai-compatible">OpenAI-compatible</option>
-        <option value="deepseek-web">DeepSeek Web</option>
-      </select>
-      <label>外部模型 API Base URL</label>
-      <input id="upstreamUrl" value="http://127.0.0.1:11434/v1" placeholder="https://api.openai.com/v1" />
-      <label>外部模型 API Key</label>
-      <input id="upstreamKey" type="password" placeholder="上游模型服务 key，可为空" />
-      <label>DeepSeek Web Session JSON / Cookie</label>
-      <textarea id="deepseekSession" placeholder="可留空，后端会尝试读取 ~/.model-toolcall-adapter/deepseek_session.json；如果提示 invalid token，请重新登录 DeepSeek Web 后粘贴并保存新的 Session"></textarea>
-      <div class="row" style="margin-top:10px">
-        <button id="loginBtn">登录并获取模型</button>
-        <button id="deepseekLoginBtn" class="secondary">刷新 DeepSeek 登录</button>
-        <button id="clearBtn" class="secondary">清空</button>
+      <h1>Adapter Setup</h1>
+      <p>把不支持工具调用的模型桥接成 OpenAI 风格接口。</p>
+      <div class="steps">
+        <div id="nav1" class="step-nav active">1. 选择供应商</div>
+        <div id="nav2" class="step-nav">2. 登录 DeepSeek</div>
+        <div id="nav3" class="step-nav">3. 启动桥接</div>
       </div>
-      <div id="loginStatus" class="status"></div>
-
-      <label>模型</label>
-      <select id="modelSelect"></select>
-
-      <h2>Responses 参数</h2>
-      <label>Instructions</label>
-      <textarea id="instructions">你是一个会按需调用工具的助手。需要查询港股行情、公司概况或价格时，必须先调用工具，不要直接编造数据。</textarea>
-      <label>Tools JSON</label>
-      <textarea id="toolsJson">[
-  {
-    "type": "function",
-    "name": "get_overview",
-    "description": "Get HK stock overview by symbol",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "symbol": { "type": "string", "description": "Ticker like 0700.HK" },
-        "market": { "type": "string", "enum": ["hk"], "default": "hk" },
-        "modules": {
-          "type": "array",
-          "items": { "type": "string" },
-          "default": ["price"]
-        },
-        "base_url": {
-          "type": "string",
-          "default": "http://127.0.0.1:8009/overview"
-        }
-      },
-      "required": ["symbol"]
-    }
-  }
-]</textarea>
-      <label>Max Output Tokens</label>
-      <input id="maxTokens" type="number" value="1024" min="1" max="32000" />
     </aside>
-
     <section>
-      <div>
-        <h1>对话</h1>
-        <div class="status">发送后走 <code>/v1/responses</code>，返回文本或标准 <code>function_call</code>。</div>
+      <div id="step1" class="step active">
+        <div class="panel">
+          <h2>选择模型供应商</h2>
+          <p>这个选择会写入本地配置文件。后续请求仍然可以用 header 覆盖。</p>
+          <label>供应商</label>
+          <select id="provider">
+            <option value="deepseek-web">DeepSeek Web</option>
+            <option value="openai-compatible">OpenAI-compatible</option>
+          </select>
+          <div class="row" style="margin-top:14px">
+            <button id="saveProvider">保存并继续</button>
+            <button id="reloadState" class="secondary">刷新状态</button>
+          </div>
+          <div id="providerStatus" class="status"></div>
+        </div>
+        <div class="panel">
+          <h2>当前配置</h2>
+          <div id="stateView"></div>
+        </div>
       </div>
-      <div id="chat" class="chat"></div>
-      <div class="composer">
-        <textarea id="input" placeholder="例如：查一下北京天气"></textarea>
-        <button id="sendBtn">发送</button>
+
+      <div id="step2" class="step">
+        <div class="panel">
+          <h2>DeepSeek Web 登录</h2>
+          <p>adapter 会启动一个独立浏览器 profile，并开启 DevTools 调试端口。只读取这个受控浏览器里的 DeepSeek session。</p>
+          <div class="row">
+            <button id="startBrowser">打开受控浏览器登录</button>
+            <button id="captureSession" class="blue">已登录，捕获 Session</button>
+            <button id="skipLogin" class="secondary">跳过</button>
+          </div>
+          <div id="browserStatus" class="status"></div>
+        </div>
+        <div class="panel">
+          <h2>手动 fallback</h2>
+          <p>如果浏览器调试端口不可用，可以粘贴 Session JSON 或 Cookie 保存。</p>
+          <textarea id="manualSession" placeholder='{"cookie":"ds_session=...; ...","bearer":"optional-token"}'></textarea>
+          <div class="row" style="margin-top:10px">
+            <button id="saveManualSession" class="secondary">保存手动 Session</button>
+          </div>
+          <div id="manualStatus" class="status"></div>
+        </div>
+      </div>
+
+      <div id="step3" class="step">
+        <div class="panel">
+          <h2>桥接接口已准备</h2>
+          <p>把下面的 Base URL 和 Key 配到你的客户端。工具由你的 runtime 执行，adapter 只输出标准工具调用。</p>
+          <div id="bridgeView"></div>
+          <div class="row" style="margin-top:14px">
+            <button id="copyKey">复制 Key</button>
+            <button id="fetchModels" class="secondary">验证模型列表</button>
+            <button id="configureCodex" class="blue">一键配置 Codex</button>
+          </div>
+          <div id="bridgeStatus" class="status"></div>
+        </div>
+        <div class="grid">
+          <div class="panel">
+            <h2>Codex 配置</h2>
+            <pre id="codexExample"></pre>
+          </div>
+          <div class="panel">
+            <h2>Responses 示例</h2>
+            <pre id="responsesExample"></pre>
+          </div>
+          <div class="panel">
+            <h2>Chat Completions 示例</h2>
+            <pre id="chatExample"></pre>
+          </div>
+        </div>
       </div>
     </section>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const state = {
-      input: []
-    };
-
-    function load() {
-      $("adapterUrl").value = localStorage.getItem("adapterUrl") || $("adapterUrl").value;
-      $("adapterKey").value = localStorage.getItem("adapterKey") || "";
-      $("providerSelect").value = localStorage.getItem("provider") || "openai-compatible";
-      $("upstreamUrl").value = localStorage.getItem("upstreamUrl") || $("upstreamUrl").value;
-      $("upstreamKey").value = sessionStorage.getItem("upstreamKey") || "";
-      $("deepseekSession").value = sessionStorage.getItem("deepseekSession") || "";
-      $("modelSelect").innerHTML = `<option value="${localStorage.getItem("model") || "local-model"}">${localStorage.getItem("model") || "local-model"}</option>`;
-      updateProviderMode();
-      render();
-    }
-
-    function headers() {
-      const h = { "content-type": "application/json" };
-      const key = $("adapterKey").value.trim();
-      if (key) h.authorization = `Bearer ${key}`;
-      const provider = $("providerSelect").value;
-      const upstreamUrl = $("upstreamUrl").value.trim();
-      const upstreamKey = $("upstreamKey").value.trim();
-      const deepseekSession = $("deepseekSession").value.trim();
-      if (provider) h["x-upstream-provider"] = provider;
-      if (upstreamUrl) h["x-upstream-base-url"] = upstreamUrl;
-      if (upstreamKey) h["x-upstream-api-key"] = upstreamKey;
-      if (deepseekSession) h["x-deepseek-session"] = deepseekSession;
-      return h;
-    }
+    const app = { state: null };
 
     function adapterUrl(path) {
-      return `${$("adapterUrl").value.replace(/\/$/, "")}${path}`;
+      return `${location.origin}${path}`;
+    }
+
+    function authHeaders() {
+      const key = app.state?.setup?.adapter_api_key || "";
+      const headers = { "content-type": "application/json" };
+      if (key) headers.authorization = `Bearer ${key}`;
+      return headers;
+    }
+
+    function setupHeaders() {
+      return { "content-type": "application/json" };
+    }
+
+    function setStep(step) {
+      [1, 2, 3].forEach((n) => {
+        $(`step${n}`).classList.toggle("active", n === step);
+        $(`nav${n}`).classList.toggle("active", n === step);
+      });
     }
 
     function setStatus(id, text, kind = "") {
@@ -235,212 +239,193 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
       el.className = `status ${kind}`;
     }
 
-    async function login() {
-      localStorage.setItem("adapterUrl", $("adapterUrl").value.trim());
-      localStorage.setItem("adapterKey", $("adapterKey").value);
-      localStorage.setItem("provider", $("providerSelect").value);
-      localStorage.setItem("upstreamUrl", $("upstreamUrl").value.trim());
-      sessionStorage.setItem("upstreamKey", $("upstreamKey").value);
-      sessionStorage.setItem("deepseekSession", $("deepseekSession").value);
-      setStatus("loginStatus", "正在获取模型...");
-      try {
-        if ($("providerSelect").value === "deepseek-web" && $("deepseekSession").value.trim()) {
-          const saveRes = await fetch(adapterUrl("/deepseek-web/session"), {
-            method: "POST",
-            headers: headers(),
-            body: JSON.stringify({ session: $("deepseekSession").value.trim() })
-          });
-          const saveBody = await saveRes.json();
-          if (!saveRes.ok) throw new Error(saveBody?.error?.message || saveRes.statusText);
-        }
-        const res = await fetch(adapterUrl("/v1/models"), { headers: headers() });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body?.error?.message || res.statusText);
-        const models = Array.isArray(body.data) ? body.data.map((m) => m.id).filter(Boolean) : [];
-        if (!models.length) throw new Error("模型列表为空");
-        $("modelSelect").innerHTML = models.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
-        const savedModel = localStorage.getItem("model");
-        $("modelSelect").value = models.includes(savedModel) ? savedModel : models[0];
-        localStorage.setItem("model", $("modelSelect").value);
-        setStatus("loginStatus", `已获取 ${models.length} 个模型`, "ok");
-      } catch (err) {
-        setStatus("loginStatus", err.message || String(err), "bad");
-      }
+    async function loadState() {
+      const res = await fetch(adapterUrl("/setup/state"));
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error?.message || res.statusText);
+      app.state = body;
+      $("provider").value = body.setup.provider || "deepseek-web";
+      renderState();
+      renderBridge();
+      return body;
     }
 
-    async function refreshDeepSeekLogin() {
-      localStorage.setItem("adapterUrl", $("adapterUrl").value.trim());
-      localStorage.setItem("adapterKey", $("adapterKey").value);
-      setStatus("loginStatus", "正在打开 DeepSeek 登录窗口...");
-      $("deepseekLoginBtn").disabled = true;
+    function renderState() {
+      const s = app.state?.setup || {};
+      const session = app.state?.deepseek_session || {};
+      $("stateView").innerHTML = [
+        kv("Config File", s.config_file || ""),
+        kv("Provider", s.provider || ""),
+        kv("Adapter Key", s.adapter_api_key || ""),
+        kv("Session", session.configured ? `${session.source} · ${session.format} · ${session.bytes} bytes` : "missing")
+      ].join("");
+    }
+
+    function renderBridge() {
+      const s = app.state?.setup || {};
+      const provider = s.provider || "deepseek-web";
+      const model = provider === "deepseek-web" ? "deepseek-web/reasoner" : (s.upstream_model || "local-model");
+      $("bridgeView").innerHTML = [
+        kv("Base URL", s.openai_base_url || `${location.origin}/v1`),
+        kv("Adapter Key", s.adapter_api_key || ""),
+        kv("Provider", provider),
+        kv("Model", model)
+      ].join("");
+      $("codexExample").textContent = `[model_providers.ModelToolCallAdapter]
+name = "ModelToolCallAdapter"
+base_url = "${s.openai_base_url || `${location.origin}/v1`}"
+wire_api = "responses"
+requires_openai_auth = true
+
+# auth.json:
+{ "OPENAI_API_KEY": "${s.adapter_api_key || "YOUR_KEY"}" }`;
+      $("responsesExample").textContent = `curl ${location.origin}/v1/responses \\
+  -H 'content-type: application/json' \\
+  -H 'authorization: Bearer ${s.adapter_api_key || "YOUR_KEY"}' \\
+  -d '${JSON.stringify({
+    model,
+    input: "需要外部信息时先发起工具调用",
+    tools: [{ type: "function", name: "search_web", description: "Search by query", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } }]
+  }, null, 2)}'`;
+      $("chatExample").textContent = `curl ${location.origin}/v1/chat/completions \\
+  -H 'content-type: application/json' \\
+  -H 'authorization: Bearer ${s.adapter_api_key || "YOUR_KEY"}' \\
+  -d '${JSON.stringify({
+    model,
+    messages: [{ role: "user", content: "查一下北京天气" }],
+    tools: [{ type: "function", function: { name: "get_weather", description: "Get weather by city", parameters: { type: "object", properties: { city: { type: "string" } }, required: ["city"] } } }]
+  }, null, 2)}'`;
+    }
+
+    function kv(key, value) {
+      return `<div class="kv"><div class="key">${escapeHtml(key)}</div><div class="value">${escapeHtml(value)}</div></div>`;
+    }
+
+    async function saveProvider() {
+      setStatus("providerStatus", "正在保存...");
+      const provider = $("provider").value;
+      const res = await fetch(adapterUrl("/setup/provider"), {
+        method: "POST",
+        headers: setupHeaders(),
+        body: JSON.stringify({ provider })
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error?.message || res.statusText);
+      await loadState();
+      setStatus("providerStatus", "已保存", "ok");
+      setStep(provider === "deepseek-web" ? 2 : 3);
+    }
+
+    async function startBrowser() {
+      setStatus("browserStatus", "正在启动受控浏览器...");
+      $("startBrowser").disabled = true;
       try {
-        const res = await fetch(adapterUrl("/deepseek-web/login"), {
+        const res = await fetch(adapterUrl("/setup/deepseek-browser/start"), {
           method: "POST",
-          headers: headers()
+          headers: setupHeaders()
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body?.error?.message || res.statusText);
-        $("deepseekSession").value = "";
-        sessionStorage.removeItem("deepseekSession");
-        setStatus("loginStatus", `DeepSeek 登录页已打开。登录后粘贴 Session 并点“登录并获取模型”：${body.session_file || ""}`, "ok");
+        setStatus("browserStatus", `浏览器已打开。登录后回来点击捕获 Session。调试端口 ${body.port}`, "ok");
+        await loadState();
       } catch (err) {
-        setStatus("loginStatus", err.message || String(err), "bad");
+        setStatus("browserStatus", err.message || String(err), "bad");
       } finally {
-        $("deepseekLoginBtn").disabled = false;
+        $("startBrowser").disabled = false;
       }
     }
 
-    async function send() {
-      const text = $("input").value.trim();
-      if (!text) return;
-      const tools = parseTools();
-      const model = $("modelSelect").value || "local-model";
-      localStorage.setItem("model", model);
-      state.input.push({ role: "user", content: [{ type: "input_text", text }] });
-      $("input").value = "";
-      render();
-
-      $("sendBtn").disabled = true;
+    async function captureSession() {
+      setStatus("browserStatus", "正在从受控浏览器捕获 Session...");
+      $("captureSession").disabled = true;
       try {
-        const payload = {
-          model,
-          instructions: $("instructions").value,
-          input: state.input,
-          tools,
-          max_output_tokens: Number($("maxTokens").value || 1024),
-          stream: false
-        };
-        const res = await fetch(adapterUrl("/v1/responses"), {
+        const res = await fetch(adapterUrl("/setup/deepseek-browser/capture"), {
           method: "POST",
-          headers: headers(),
-          body: JSON.stringify(payload)
+          headers: setupHeaders(),
+          body: JSON.stringify({})
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body?.error?.message || res.statusText);
-        await applyResponse(body);
+        await loadState();
+        setStatus("browserStatus", `已保存 Session：${body.session_file}`, "ok");
+        setStep(3);
       } catch (err) {
-        state.input.push({ role: "assistant", content: [{ type: "output_text", text: `Error: ${err.message || err}` }] });
+        setStatus("browserStatus", err.message || String(err), "bad");
       } finally {
-        $("sendBtn").disabled = false;
-        render();
+        $("captureSession").disabled = false;
       }
     }
 
-    function parseTools() {
-      const raw = $("toolsJson").value.trim();
-      if (!raw) return [];
+    async function saveManualSession() {
+      const session = $("manualSession").value.trim();
+      if (!session) return setStatus("manualStatus", "请先粘贴 Session JSON 或 Cookie", "warn");
+      setStatus("manualStatus", "正在保存...");
+      const res = await fetch(adapterUrl("/deepseek-web/session"), {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ session })
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error?.message || res.statusText);
+      await loadState();
+      setStatus("manualStatus", `已保存：${body.session_file}`, "ok");
+      setStep(3);
+    }
+
+    async function fetchModels() {
+      setStatus("bridgeStatus", "正在验证 /v1/models...");
+      const provider = app.state?.setup?.provider || "deepseek-web";
+      const headers = authHeaders();
+      headers["x-upstream-provider"] = provider;
+      const res = await fetch(adapterUrl("/v1/models"), { headers });
+      const body = await res.json();
+      if (!res.ok) return setStatus("bridgeStatus", body?.error?.message || res.statusText, "bad");
+      const models = (body.data || []).map((m) => m.id).join(", ");
+      setStatus("bridgeStatus", `模型可用：${models}`, "ok");
+    }
+
+    async function copyKey() {
+      const key = app.state?.setup?.adapter_api_key || "";
+      await navigator.clipboard.writeText(key);
+      setStatus("bridgeStatus", "Key 已复制", "ok");
+    }
+
+    async function configureCodex() {
+      setStatus("bridgeStatus", "正在写入 ~/.codex/config.toml 和 auth.json...");
+      $("configureCodex").disabled = true;
       try {
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [parsed];
-      } catch (err) {
-        throw new Error(`Tools JSON 格式错误：${err.message}`);
-      }
-    }
-
-    async function applyResponse(body) {
-      const serverHandledCalls = new Set(
-        (body.output || [])
-          .filter((item) => item.type === "function_call_output")
-          .map((item) => item.call_id)
-      );
-      for (const item of body.output || []) {
-        if (item.type === "function_call") {
-          state.input.push({
-            type: "function_call",
-            call_id: item.call_id,
-            name: item.name,
-            arguments: item.arguments || "{}"
-          });
-          if (!serverHandledCalls.has(item.call_id)) {
-            const toolResult = await executeToolCall(item);
-            state.input.push({
-              type: "function_call_output",
-              call_id: item.call_id,
-              output: toolResult
-            });
-          }
-        } else if (item.type === "function_call_output") {
-          state.input.push({
-            type: "function_call_output",
-            call_id: item.call_id,
-            output: item.output || ""
-          });
-        } else if (item.type === "message") {
-          state.input.push({
-            role: "assistant",
-            content: item.content || []
-          });
-        }
-      }
-    }
-
-    async function executeToolCall(item) {
-      const args = parseToolArgs(item.arguments || "{}");
-      const name = (item.name || "").trim();
-      if (name === "get_overview" || name === "get_quote") {
-        const res = await fetch(adapterUrl("/tools/market/overview"), {
+        const res = await fetch(adapterUrl("/setup/codex/apply"), {
           method: "POST",
-          headers: headers(),
-          body: JSON.stringify(args)
+          headers: setupHeaders()
         });
         const body = await res.json();
         if (!res.ok) throw new Error(body?.error?.message || res.statusText);
-        return JSON.stringify(body, null, 2);
-      }
-      return "前端演示模式：这里应由你的业务 runtime 执行工具后写入真实结果。";
-    }
-
-    function parseToolArgs(raw) {
-      try {
-        return JSON.parse(raw || "{}");
+        const backups = (body.backups || []).length ? `；备份：${body.backups.join(", ")}` : "";
+        setStatus("bridgeStatus", `Codex 已配置。重启 Codex 后使用 ${body.provider} / ${body.model}${backups}`, "ok");
       } catch (err) {
-        throw new Error(`工具参数 JSON 格式错误：${err.message}`);
+        setStatus("bridgeStatus", err.message || String(err), "bad");
+      } finally {
+        $("configureCodex").disabled = false;
       }
-    }
-
-    function render() {
-      const chat = $("chat");
-      chat.innerHTML = state.input.map(renderItem).join("");
-      chat.scrollTop = chat.scrollHeight;
-    }
-
-    function renderItem(item) {
-      if (item.type === "function_call") {
-        return `<div class="msg"><div class="role">tool call · ${escapeHtml(item.name)}</div><div class="tool">${escapeHtml(item.arguments)}</div></div>`;
-      }
-      if (item.type === "function_call_output") {
-        return `<div class="msg"><div class="role">tool result · ${escapeHtml(item.call_id)}</div><div class="tool">${escapeHtml(item.output)}</div></div>`;
-      }
-      const text = (item.content || []).map((part) => part.text || part.input_text || part.output_text || "").join("\n");
-      return `<div class="msg"><div class="role">${escapeHtml(item.role || "message")}</div>${escapeHtml(text)}</div>`;
     }
 
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
     }
 
-    $("loginBtn").addEventListener("click", login);
-    $("deepseekLoginBtn").addEventListener("click", refreshDeepSeekLogin);
-    $("clearBtn").addEventListener("click", () => { state.input = []; render(); });
-    $("sendBtn").addEventListener("click", send);
-    $("providerSelect").addEventListener("change", updateProviderMode);
-    $("input").addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") send();
-    });
-    load();
+    $("saveProvider").addEventListener("click", () => saveProvider().catch((err) => setStatus("providerStatus", err.message || String(err), "bad")));
+    $("reloadState").addEventListener("click", () => loadState().catch((err) => setStatus("providerStatus", err.message || String(err), "bad")));
+    $("startBrowser").addEventListener("click", startBrowser);
+    $("captureSession").addEventListener("click", captureSession);
+    $("skipLogin").addEventListener("click", () => setStep(3));
+    $("saveManualSession").addEventListener("click", () => saveManualSession().catch((err) => setStatus("manualStatus", err.message || String(err), "bad")));
+    $("fetchModels").addEventListener("click", fetchModels);
+    $("copyKey").addEventListener("click", copyKey);
+    $("configureCodex").addEventListener("click", configureCodex);
 
-    function updateProviderMode() {
-      const deepseek = $("providerSelect").value === "deepseek-web";
-      $("upstreamUrl").disabled = deepseek;
-      $("upstreamUrl").closest("label");
-      $("upstreamKey").placeholder = deepseek ? "可填 DeepSeek Cookie；优先使用下方 Session JSON" : "上游模型服务 key，可为空";
-      $("deepseekSession").disabled = !deepseek;
-      $("deepseekLoginBtn").disabled = !deepseek;
-      if (deepseek && (!$("modelSelect").value || $("modelSelect").value === "local-model")) {
-        $("modelSelect").innerHTML = `<option value="deepseek-web/reasoner">deepseek-web/reasoner</option><option value="deepseek-web/chat">deepseek-web/chat</option>`;
-        $("modelSelect").value = "deepseek-web/reasoner";
-      }
-    }
+    loadState()
+      .then((state) => setStep(state.setup.provider === "deepseek-web" && !state.deepseek_session.configured ? 2 : 1))
+      .catch((err) => setStatus("providerStatus", err.message || String(err), "bad"));
   </script>
 </body>
 </html>

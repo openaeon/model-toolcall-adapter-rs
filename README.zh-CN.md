@@ -19,7 +19,7 @@
 - 从纯文本模型输出中容错解析 XML、JSON 和常见 tool-call 形态。
 - 支持 OpenAI-compatible 上游，例如本地 Ollama、vLLM、LM Studio、llama.cpp 风格 API。
 - 内置 DeepSeek Web 上游 provider，支持本地 session 存储、PoW、SSE 解析、reasoning/text 分离。
-- 内置 `/ui` 调试界面，用于测试模型、工具定义和 Responses 工具闭环。
+- 内置 `/ui` 启动向导，用于选择供应商、生成 adapter key、登录 DeepSeek Web 并展示桥接接口。
 
 本项目是独立仓库。构建和运行时不依赖 `../crates/aeon-claw-api`、`aeon-claw-cli` 或 FCACoreai workspace。
 
@@ -66,7 +66,7 @@ model-toolcall-adapter-rs
 - `src/wire/*`：处理请求/响应 wire format 转换。
 - `src/protocol/mod.rs`：渲染文本工具协议，并解析模型输出里的工具调用。
 - `src/upstream.rs`：路由到 OpenAI-compatible 或 DeepSeek Web 上游。
-- `src/deepseek_web.rs`：独立 DeepSeek Web 客户端实现。
+- `src/providers/deepseek_web/`：独立 DeepSeek Web provider、session、PoW 与 SSE 解析。
 - `src/responses_store.rs`：内存态 Responses 存储，用于 retrieve、input-items、cancel 和多轮续接。
 
 ## 快速开始
@@ -88,16 +88,41 @@ cargo run -- \
 http://127.0.0.1:8787/ui
 ```
 
-然后填写：
+首次启动会自动创建本地配置：
 
-- Adapter API：`http://127.0.0.1:8787`
-- Adapter API Key：`local-dev-key`
-- Upstream API Base URL：你的 OpenAI-compatible 模型端点
-- Model：上游真实模型名，或通过 `ADAPTER_MODEL_ALIASES` 暴露的别名
+```text
+~/.model-toolcall-adapter/config.json
+```
+
+其中会随机生成 `adapter_api_key`。打开 `/ui` 后按向导完成：
+
+- 第一步选择供应商：`openai-compatible` 或 `deepseek-web`。
+- 第二步 DeepSeek Web 会启动独立浏览器 profile 登录，并从这个受控浏览器捕获 session。
+- 第三步展示 Base URL、Adapter Key、模型名和请求示例，也可以一键写入 Codex 配置。
+
+## Codex 一键配置
+
+启动向导第三步的“一键配置 Codex”会：
+
+- 备份 `~/.codex/config.toml` 和 `~/.codex/auth.json`。
+- 在 `config.toml` 顶部写入 adapter 的模型选择，并在文件末尾写入 provider 表。
+- 将当前随机 `adapter_api_key` 写入 `auth.json` 的 `OPENAI_API_KEY`。
+
+写入的 provider 使用 Codex 官方支持的 Responses wire：
+
+```toml
+[model_providers.ModelToolCallAdapter]
+name = "ModelToolCallAdapter"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+如果 Codex CLI/app 已经在运行，配置后需要重启。
 
 ## 配置
 
-每个 CLI 参数都有对应环境变量。
+每个 CLI 参数都有对应环境变量。CLI/env 显式值优先于本地配置文件。
 
 ```bash
 export ADAPTER_BIND=127.0.0.1:8787
@@ -109,6 +134,14 @@ export ADAPTER_API_KEY=local-dev-key
 export ADAPTER_DEEPSEEK_SESSION_FILE=~/.model-toolcall-adapter/deepseek_session.json
 cargo run
 ```
+
+如果没有设置 `ADAPTER_API_KEY`，adapter 会读取或创建：
+
+```text
+~/.model-toolcall-adapter/config.json
+```
+
+并使用其中的随机 `adapter_api_key` 保护 API。
 
 `ADAPTER_MODEL_ALIASES` 是逗号分隔的映射：
 
@@ -126,7 +159,7 @@ export ADAPTER_MODEL_ALIASES=gpt-5-codex=deepseek-web/reasoner,gpt-5-mini=deepse
 
 ## 鉴权
 
-如果 `ADAPTER_API_KEY` 为空，adapter 端点不鉴权。
+如果 `ADAPTER_API_KEY` 和本地配置里的 `adapter_api_key` 都为空，adapter 端点不鉴权。
 
 如果设置了 `ADAPTER_API_KEY`，请求需要携带以下任一 header：
 
@@ -167,11 +200,13 @@ x-deepseek-session: {"cookie":"...","bearer":"...","last_session_id":"..."}
 
 DeepSeek Web 支持完全在当前仓库内实现。
 
-UI 可以通过 `/deepseek-web/login` 打开 DeepSeek 登录页。登录后，把 Session JSON/Cookie 粘贴到 UI 并点击“登录/获取模型”，adapter 会保存到：
+UI 会通过 `/setup/deepseek-browser/start` 启动一个独立浏览器 profile，并开启 DevTools 调试端口。用户在这个受控浏览器里登录 DeepSeek Web 后，点击捕获 session，adapter 会把 DeepSeek cookie/localStorage 中可用凭据保存到：
 
 ```text
 ~/.model-toolcall-adapter/deepseek_session.json
 ```
+
+如果本机没有 Chrome/Edge/Chromium/Brave，或调试端口不可用，UI 会保留手动粘贴 Session JSON/Cookie 的 fallback。
 
 保存对象可以包含：
 
@@ -201,6 +236,11 @@ DeepSeek Web 是非官方网页上游。如果网页服务调整私有端点、h
 | `GET /v1/responses/{response_id}/input_items` | 列出保存的 response 输入项 |
 | `POST /v1/responses/{response_id}/cancel` | 取消 background response |
 | `POST /v1/responses/compact` | 压缩 response 上下文 |
+| `GET /setup/state` | 读取启动向导状态和本地配置 |
+| `POST /setup/provider` | 保存供应商选择 |
+| `POST /setup/deepseek-browser/start` | 启动受控浏览器登录 DeepSeek Web |
+| `POST /setup/deepseek-browser/capture` | 从受控浏览器捕获并保存 DeepSeek session |
+| `POST /setup/codex/apply` | 备份并写入 Codex config/auth |
 | `POST /deepseek-web/login` | 打开 DeepSeek 登录页 |
 | `POST /deepseek-web/session` | 本地保存 DeepSeek session |
 
@@ -303,14 +343,11 @@ curl http://127.0.0.1:8787/v1/responses \
 
 adapter 会把上一轮输入、上一轮模型输出和新的工具结果拼入下一次上游 prompt。
 
-## 内置工具
+## 工具执行边界
 
-Responses 模式下，adapter 可以自动执行少量内置工具：
+adapter 默认不执行业务工具。
 
-- `get_overview`
-- `get_quote`
-
-这些工具主要用于本地测试闭环行为。生产环境中的真实工具执行通常应该放在调用方 agent runtime 中。
+它的职责是把用户传入的工具 schema 转成模型可理解的提示，把普通文本模型输出解析回标准工具调用，并接收调用方回传的 `function_call_output` 继续多轮对话。真实工具应由你的 agent runtime、应用服务或客户端执行。
 
 ## 开发
 
@@ -329,7 +366,7 @@ cargo test
 - 非流式 Chat Completions、Messages、Responses 兼容。
 - Responses create、retrieve、input-items、cancel、compact 端点。
 - `previous_response_id` 多轮续接。
-- Responses 顶层 `function_call` 与 `function_call_output` 工具闭环。
+- Responses 顶层 `function_call` 输出与 `function_call_output` 续接。
 - 模型别名。
 - Adapter API key 鉴权。
 - 按请求覆盖上游 base URL 和 API key。
@@ -341,8 +378,7 @@ cargo test
 - Streaming 输出。
 - DeepSeek Web 登录时自动提取浏览器 Cookie。
 - 进程内存之外的持久 response 存储。
-- 完整 `tool_choice` 行为。
-- 生产级工具执行沙箱。
+- 更完整的 `tool_choice` 边界情况。
 
 ## License
 

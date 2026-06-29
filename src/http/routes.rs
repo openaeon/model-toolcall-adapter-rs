@@ -1,22 +1,26 @@
+use std::path::{Path as FsPath, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Json;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
 
+use crate::config::{update_local_config, LocalConfig};
 use crate::error::AdapterError;
-use crate::http::AppState;
+use crate::http::{AppState, DeepSeekBrowserProcess};
 use crate::protocol::{parse_tool_calls, render_tool_protocol_prompt};
+use crate::providers::deepseek_web::default_session_path as default_deepseek_session_path;
 use crate::responses_store;
-use crate::types::{ParsedToolCall, UnifiedContent, UnifiedMessage, UnifiedRequest};
+use crate::types::UnifiedRequest;
 use crate::ui::INDEX_HTML;
-use crate::upstream::{default_deepseek_session_path, UpstreamRequestOptions};
+use crate::upstream::UpstreamRequestOptions;
 use crate::wire::{chat, messages, responses, WireMode};
-
-const MAX_AUTO_TOOL_ROUNDS: usize = 4;
 
 pub async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
@@ -24,6 +28,168 @@ pub async fn health() -> Json<Value> {
 
 pub async fn ui() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+pub async fn setup_state(State(state): State<Arc<AppState>>) -> Result<Json<Value>, AdapterError> {
+    let local = LocalConfig::load_or_default()
+        .map_err(|error| AdapterError::Upstream(format!("read local config: {error}")))?;
+    let browser = {
+        let guard = state
+            .setup
+            .lock()
+            .map_err(|_| AdapterError::Upstream("setup state lock poisoned".to_string()))?;
+        guard.deepseek_browser.as_ref().map(|browser| {
+            json!({
+                "port": browser.port,
+                "user_data_dir": browser.user_data_dir,
+                "debug_url": format!("http://127.0.0.1:{}", browser.port),
+                "running": browser.child.is_some(),
+            })
+        })
+    };
+    let session_status = crate::providers::deepseek_web::session_status_from_options(
+        &UpstreamRequestOptions::default(),
+    );
+    Ok(Json(json!({
+        "setup": local.setup_json(&state.config.bind),
+        "deepseek_browser": browser,
+        "deepseek_session": session_status,
+    })))
+}
+
+pub async fn setup_provider(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AdapterError> {
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| matches!(*value, "openai-compatible" | "deepseek-web"))
+        .ok_or_else(|| {
+            AdapterError::InvalidRequest(
+                "provider must be openai-compatible or deepseek-web".to_string(),
+            )
+        })?;
+    let local = update_local_config(|config| {
+        config.provider = Some(provider.to_string());
+        if provider == "deepseek-web" {
+            config.upstream_model = Some("deepseek-web/reasoner".to_string());
+        }
+    })
+    .map_err(|error| AdapterError::Upstream(format!("write local config: {error}")))?;
+    Ok(Json(json!({
+        "status": "saved",
+        "setup": local.setup_json(&state.config.bind),
+    })))
+}
+
+pub async fn setup_deepseek_browser_start(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AdapterError> {
+    let browser = start_deepseek_browser()?;
+    let body = json!({
+        "status": "opened",
+        "login_url": "https://chat.deepseek.com/",
+        "debug_url": format!("http://127.0.0.1:{}", browser.port),
+        "port": browser.port,
+        "user_data_dir": browser.user_data_dir,
+    });
+    let mut guard = state
+        .setup
+        .lock()
+        .map_err(|_| AdapterError::Upstream("setup state lock poisoned".to_string()))?;
+    guard.deepseek_browser = Some(browser);
+    Ok(Json(body))
+}
+
+pub async fn setup_deepseek_browser_capture(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AdapterError> {
+    let port = payload
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .or_else(|| {
+            state
+                .setup
+                .lock()
+                .ok()
+                .and_then(|guard| guard.deepseek_browser.as_ref().map(|browser| browser.port))
+        })
+        .unwrap_or(DEFAULT_DEEPSEEK_DEBUG_PORT);
+    let session = capture_deepseek_session(port).await?;
+    let path = default_deepseek_session_path()?;
+    save_deepseek_session(&path, &session)?;
+    let status = crate::providers::deepseek_web::session_status_from_options(
+        &UpstreamRequestOptions::default(),
+    );
+    Ok(Json(json!({
+        "status": "captured",
+        "session_file": path,
+        "session": status,
+    })))
+}
+
+pub async fn setup_codex_apply(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AdapterError> {
+    let local = LocalConfig::load_or_default()
+        .map_err(|error| AdapterError::Upstream(format!("read local config: {error}")))?;
+    let key = local.adapter_api_key.trim().to_string();
+    if key.is_empty() {
+        return Err(AdapterError::InvalidRequest(
+            "adapter api key is missing; reload setup state first".to_string(),
+        ));
+    }
+    let provider = "ModelToolCallAdapter";
+    let model = if local.provider.as_deref() == Some("deepseek-web") {
+        "deepseek-web/reasoner"
+    } else {
+        local
+            .upstream_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("local-model")
+    };
+    let codex_dir = codex_home_dir()?;
+    std::fs::create_dir_all(&codex_dir).map_err(|error| {
+        AdapterError::Upstream(format!(
+            "failed to create Codex config dir {}: {error}",
+            codex_dir.display()
+        ))
+    })?;
+    let config_path = codex_dir.join("config.toml");
+    let auth_path = codex_dir.join("auth.json");
+    let mut backups = Vec::new();
+    if let Some(path) = backup_file(&config_path)? {
+        backups.push(path);
+    }
+    if let Some(path) = backup_file(&auth_path)? {
+        backups.push(path);
+    }
+
+    let base_url = format!("http://{}/v1", state.config.bind);
+    write_codex_config(&config_path, provider, model, &base_url)?;
+    write_codex_auth(&auth_path, &key)?;
+
+    Ok(Json(json!({
+        "status": "configured",
+        "codex_dir": codex_dir,
+        "config_file": config_path,
+        "auth_file": auth_path,
+        "backups": backups,
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "auth": {
+            "auth_json_key": "OPENAI_API_KEY",
+            "requires_openai_auth": true
+        },
+        "message": "Codex config written. Restart Codex CLI/app before using the adapter provider."
+    })))
 }
 
 pub async fn deepseek_web_login(
@@ -66,6 +232,14 @@ pub async fn deepseek_web_session_save(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| AdapterError::InvalidRequest("session is required".to_string()))?;
     let path = default_deepseek_session_path()?;
+    save_deepseek_session(&path, session)?;
+    Ok(Json(json!({
+        "status": "saved",
+        "session_file": path,
+    })))
+}
+
+fn save_deepseek_session(path: &FsPath, session: &str) -> Result<(), AdapterError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             AdapterError::Upstream(format!(
@@ -74,89 +248,11 @@ pub async fn deepseek_web_session_save(
             ))
         })?;
     }
-    std::fs::write(&path, normalize_deepseek_session_for_storage(session)?).map_err(|error| {
+    std::fs::write(path, normalize_deepseek_session_for_storage(session)?).map_err(|error| {
         AdapterError::Upstream(format!(
             "failed to write DeepSeek session {}: {error}",
             path.display()
         ))
-    })?;
-    Ok(Json(json!({
-        "status": "saved",
-        "session_file": path,
-    })))
-}
-
-pub async fn market_overview(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, AdapterError> {
-    verify_auth(&state, &headers)?;
-    let params = parse_market_overview_params(&payload)?;
-
-    let result = state
-        .upstream
-        .fetch_market_overview(
-            &params.base_url,
-            &params.symbol,
-            &params.market,
-            &params.modules,
-        )
-        .await?;
-    Ok(Json(result))
-}
-
-struct MarketOverviewParams {
-    symbol: String,
-    market: String,
-    modules: Vec<String>,
-    base_url: String,
-}
-
-fn parse_market_overview_params(payload: &Value) -> Result<MarketOverviewParams, AdapterError> {
-    let symbol = payload
-        .get("symbol")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| AdapterError::InvalidRequest("symbol is required".to_string()))?
-        .to_string();
-    let market = payload
-        .get("market")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("hk")
-        .to_string();
-    let modules = payload
-        .get("modules")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .unwrap_or_else(|| vec!["price".to_string()]);
-    let base_url = payload
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| std::env::var("ADAPTER_MARKET_OVERVIEW_BASE_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:8009/overview".to_string())
-        .to_string();
-
-    Ok(MarketOverviewParams {
-        symbol,
-        market,
-        modules,
-        base_url,
     })
 }
 
@@ -204,6 +300,412 @@ fn normalize_deepseek_session_for_storage(session: &str) -> Result<String, Adapt
     Ok(session.to_string())
 }
 
+const DEFAULT_DEEPSEEK_DEBUG_PORT: u16 = 9223;
+
+fn start_deepseek_browser() -> Result<DeepSeekBrowserProcess, AdapterError> {
+    let browser = find_browser_executable().ok_or_else(|| {
+        AdapterError::Upstream(
+            "Could not find Chrome, Chromium, Edge, or Brave. Install one or paste Session JSON/Cookie manually.".to_string(),
+        )
+    })?;
+    let port = DEFAULT_DEEPSEEK_DEBUG_PORT;
+    let user_data_dir = adapter_home_dir()?.join("deepseek-browser-profile");
+    std::fs::create_dir_all(&user_data_dir).map_err(|error| {
+        AdapterError::Upstream(format!(
+            "failed to create browser profile {}: {error}",
+            user_data_dir.display()
+        ))
+    })?;
+
+    let child = Command::new(&browser)
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg(format!(
+            "--user-data-dir={}",
+            user_data_dir.to_string_lossy()
+        ))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("https://chat.deepseek.com/")
+        .spawn()
+        .map_err(|error| {
+            AdapterError::Upstream(format!(
+                "failed to start controlled browser {}: {error}",
+                browser.display()
+            ))
+        })?;
+
+    Ok(DeepSeekBrowserProcess {
+        port,
+        user_data_dir,
+        child: Some(child),
+    })
+}
+
+fn find_browser_executable() -> Option<PathBuf> {
+    let candidates: &[&str] = if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    } else if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/brave-browser",
+        ]
+    };
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+        .or_else(|| find_browser_on_path())
+}
+
+fn find_browser_on_path() -> Option<PathBuf> {
+    [
+        "google-chrome",
+        "chrome",
+        "chromium",
+        "chromium-browser",
+        "msedge",
+        "brave-browser",
+    ]
+    .iter()
+    .find_map(|name| {
+        Command::new("which")
+            .arg(name)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                (!path.is_empty()).then(|| PathBuf::from(path))
+            })
+    })
+}
+
+fn adapter_home_dir() -> Result<PathBuf, AdapterError> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| AdapterError::Upstream("HOME is not set".to_string()))?;
+    Ok(PathBuf::from(home).join(".model-toolcall-adapter"))
+}
+
+async fn capture_deepseek_session(port: u16) -> Result<String, AdapterError> {
+    let http = reqwest::Client::new();
+    let tabs_url = format!("http://127.0.0.1:{port}/json");
+    let tabs = http
+        .get(&tabs_url)
+        .send()
+        .await
+        .map_err(|error| {
+            AdapterError::Upstream(format!(
+                "cannot reach controlled browser at {tabs_url}: {error}"
+            ))
+        })?
+        .json::<Value>()
+        .await
+        .map_err(|error| AdapterError::Upstream(format!("read browser tabs: {error}")))?;
+    let tab = tabs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|tab| {
+            tab.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| url.contains("chat.deepseek.com"))
+        })
+        .or_else(|| tabs.as_array().and_then(|tabs| tabs.first()))
+        .ok_or_else(|| {
+            AdapterError::Upstream("controlled browser has no debuggable tabs".to_string())
+        })?;
+    let websocket_url = tab
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AdapterError::Upstream(
+                "controlled browser tab does not expose webSocketDebuggerUrl".to_string(),
+            )
+        })?;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(websocket_url)
+        .await
+        .map_err(|error| AdapterError::Upstream(format!("connect CDP websocket: {error}")))?;
+    cdp_send(&mut ws, 1, "Network.enable", json!({})).await?;
+    let cookies = cdp_send(
+        &mut ws,
+        2,
+        "Network.getCookies",
+        json!({ "urls": ["https://chat.deepseek.com/"] }),
+    )
+    .await?;
+    let storage = cdp_send(
+        &mut ws,
+        3,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify(Object.fromEntries(Array.from({length: localStorage.length}, (_, i) => { const k = localStorage.key(i); return [k, localStorage.getItem(k)]; })))",
+            "returnByValue": true
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| json!({}));
+
+    let cookie_header = cookies
+        .get("cookies")
+        .and_then(Value::as_array)
+        .map(|cookies| {
+            cookies
+                .iter()
+                .filter(|cookie| {
+                    cookie
+                        .get("domain")
+                        .and_then(Value::as_str)
+                        .is_some_and(|domain| domain.contains("deepseek.com"))
+                })
+                .filter_map(|cookie| {
+                    let name = cookie.get("name").and_then(Value::as_str)?;
+                    let value = cookie.get("value").and_then(Value::as_str)?;
+                    Some(format!("{name}={value}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    if cookie_header.trim().is_empty() {
+        return Err(AdapterError::Upstream(
+            "DeepSeek cookies were not found. Finish login in the controlled browser, then capture again.".to_string(),
+        ));
+    }
+
+    let storage_text = storage
+        .pointer("/result/value")
+        .and_then(Value::as_str)
+        .unwrap_or("{}");
+    let storage_value = serde_json::from_str::<Value>(storage_text).unwrap_or_else(|_| json!({}));
+    let bearer = find_deepseek_bearer(&storage_value);
+    Ok(json!({
+        "cookie": cookie_header,
+        "bearer": bearer,
+        "user_agent": "Mozilla/5.0",
+        "local_storage_keys": storage_value.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+    })
+    .to_string())
+}
+
+async fn cdp_send<S>(
+    ws: &mut S,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, AdapterError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    ws.send(Message::Text(
+        json!({ "id": id, "method": method, "params": params }).to_string(),
+    ))
+    .await
+    .map_err(|error| AdapterError::Upstream(format!("send CDP {method}: {error}")))?;
+    while let Some(message) = ws.next().await {
+        let message = message
+            .map_err(|error| AdapterError::Upstream(format!("read CDP {method}: {error}")))?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|error| AdapterError::Upstream(format!("parse CDP {method}: {error}")))?;
+        if value.get("id").and_then(Value::as_u64) != Some(id) {
+            continue;
+        }
+        if let Some(error) = value.get("error") {
+            return Err(AdapterError::Upstream(format!(
+                "CDP {method} failed: {error}"
+            )));
+        }
+        return Ok(value.get("result").cloned().unwrap_or_else(|| json!({})));
+    }
+    Err(AdapterError::Upstream(format!(
+        "CDP {method} did not return a response"
+    )))
+}
+
+fn find_deepseek_bearer(storage: &Value) -> Option<String> {
+    storage.as_object().and_then(|object| {
+        object.iter().find_map(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let raw = value.as_str().unwrap_or_default();
+            if key.contains("token") || key.contains("auth") || raw.starts_with("eyJ") {
+                Some(raw.to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn codex_home_dir() -> Result<PathBuf, AdapterError> {
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| AdapterError::Upstream("HOME is not set".to_string()))?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
+fn backup_file(path: &FsPath) -> Result<Option<PathBuf>, AdapterError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut backup = path.with_extension(match path.extension().and_then(|value| value.to_str()) {
+        Some(ext) => format!("{ext}.bak"),
+        None => "bak".to_string(),
+    });
+    if backup.exists() {
+        let mut index = 1;
+        loop {
+            let candidate = PathBuf::from(format!("{}.bak.{index}", path.to_string_lossy()));
+            if !candidate.exists() {
+                backup = candidate;
+                break;
+            }
+            index += 1;
+        }
+    }
+    std::fs::copy(path, &backup).map_err(|error| {
+        AdapterError::Upstream(format!(
+            "failed to backup {} to {}: {error}",
+            path.display(),
+            backup.display()
+        ))
+    })?;
+    Ok(Some(backup))
+}
+
+fn write_codex_config(
+    path: &FsPath,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+) -> Result<(), AdapterError> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let next = replace_codex_managed_blocks(
+        &existing,
+        &codex_managed_root_block(provider, model),
+        &codex_managed_provider_block(provider, base_url),
+    );
+    std::fs::write(path, next).map_err(|error| {
+        AdapterError::Upstream(format!(
+            "failed to write Codex config {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn codex_managed_root_block(provider: &str, model: &str) -> String {
+    format!(
+        r#"# BEGIN model-toolcall-adapter root
+model_provider = "{provider}"
+model = "{model}"
+review_model = "{model}"
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+network_access = "enabled"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+# END model-toolcall-adapter root
+"#
+    )
+}
+
+fn codex_managed_provider_block(provider: &str, base_url: &str) -> String {
+    format!(
+        r#"# BEGIN model-toolcall-adapter provider
+[model_providers.{provider}]
+name = "{provider}"
+base_url = "{base_url}"
+wire_api = "responses"
+requires_openai_auth = true
+# END model-toolcall-adapter provider
+"#
+    )
+}
+
+fn replace_codex_managed_blocks(existing: &str, root_block: &str, provider_block: &str) -> String {
+    let without_root = remove_managed_block(
+        existing,
+        "# BEGIN model-toolcall-adapter root",
+        "# END model-toolcall-adapter root",
+    );
+    let without_provider = remove_managed_block(
+        &without_root,
+        "# BEGIN model-toolcall-adapter provider",
+        "# END model-toolcall-adapter provider",
+    );
+    let body = without_provider.trim();
+    if body.is_empty() {
+        format!(
+            "{}\n\n{}\n",
+            root_block.trim_end(),
+            provider_block.trim_end()
+        )
+    } else {
+        format!(
+            "{}\n\n{}\n\n{}\n",
+            root_block.trim_end(),
+            body,
+            provider_block.trim_end()
+        )
+    }
+}
+
+fn remove_managed_block(existing: &str, begin: &str, end_marker: &str) -> String {
+    if let Some(start) = existing.find(begin) {
+        if let Some(end_rel) = existing[start..].find(end_marker) {
+            let end = start + end_rel + end_marker.len();
+            let mut output = String::new();
+            output.push_str(existing[..start].trim_end());
+            if !output.is_empty() {
+                output.push_str("\n\n");
+            }
+            output.push_str(existing[end..].trim_start_matches(['\r', '\n']));
+            return output;
+        }
+    }
+    existing.to_string()
+}
+
+fn write_codex_auth(path: &FsPath, key: &str) -> Result<(), AdapterError> {
+    let mut auth = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({})),
+        Err(_) => json!({}),
+    };
+    if !auth.is_object() {
+        auth = json!({});
+    }
+    auth["OPENAI_API_KEY"] = Value::String(key.to_string());
+    let raw = serde_json::to_string_pretty(&auth)
+        .map_err(|error| AdapterError::Upstream(format!("serialize Codex auth: {error}")))?;
+    std::fs::write(path, raw).map_err(|error| {
+        AdapterError::Upstream(format!(
+            "failed to write Codex auth {}: {error}",
+            path.display()
+        ))
+    })
+}
+
 pub async fn models(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -228,9 +730,8 @@ pub async fn chat_completions(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AdapterError> {
     tracing::info!(
-        "Route chat_completions: headers={:?}, payload={:?}",
-        headers,
-        payload
+        payload_keys = ?payload.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()),
+        "chat completions request received"
     );
     verify_auth(&state, &headers)?;
     handle(
@@ -263,9 +764,8 @@ pub async fn responses(
     Json(mut payload): Json<Value>,
 ) -> Result<Response, AdapterError> {
     tracing::info!(
-        "Route responses: headers={:?}, payload={:?}",
-        headers,
-        payload
+        payload_keys = ?payload.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()),
+        "responses request received"
     );
     verify_auth(&state, &headers)?;
     let stream = payload
@@ -369,6 +869,11 @@ pub async fn responses_compact(
                 .map(ToOwned::to_owned),
             messages: Vec::new(),
             tools: chat::parse_tools(payload.get("tools")),
+            tool_choice: chat::parse_tool_choice(payload.get("tool_choice")),
+            parallel_tool_calls: payload
+                .get("parallel_tool_calls")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             stream: payload
                 .get("stream")
                 .and_then(Value::as_bool)
@@ -413,11 +918,11 @@ fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AdapterError
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
 
-    tracing::info!(
-        "verify_auth: expected='{}', got bearer={:?}, got x-api-key={:?}",
-        expected,
-        bearer,
-        api_key
+    tracing::debug!(
+        auth_configured = !expected.is_empty(),
+        bearer_present = bearer.is_some(),
+        x_api_key_present = api_key.is_some(),
+        "verifying adapter auth"
     );
 
     if expected.is_empty() {
@@ -426,7 +931,7 @@ fn verify_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AdapterError
     if bearer == Some(expected) || api_key == Some(expected) {
         Ok(())
     } else {
-        tracing::warn!("verify_auth FAILED: keys do not match");
+        tracing::warn!("adapter auth failed");
         Err(AdapterError::Unauthorized)
     }
 }
@@ -452,7 +957,7 @@ async fn handle_value(
     tracing::info!(
         "Received request with model={:?}, upstream_options={:?}",
         request.model,
-        upstream_options
+        upstream_options.redacted()
     );
     if request.stream {
         return Err(AdapterError::StreamUnsupported);
@@ -475,13 +980,41 @@ async fn handle_value(
     let protocol = render_tool_protocol_prompt(&request.tools);
     let body = match mode {
         WireMode::Responses => {
-            let mut body = create_responses_body_with_auto_tools(
-                &state,
-                request.clone(),
-                &protocol,
-                &upstream_options,
-            )
-            .await?;
+            let prompt = request.render_prompt_with_tool_protocol(&protocol);
+            let upstream_response = state
+                .upstream
+                .complete(&request, &prompt, &upstream_options)
+                .await?;
+            if let Some(reasoning) = upstream_response.reasoning.as_deref() {
+                tracing::debug!(
+                    reasoning_chars = reasoning.chars().count(),
+                    "upstream reasoning"
+                );
+            }
+            let model_text = upstream_response.text;
+            let tool_calls = apply_tool_choice_to_tool_calls(
+                &request,
+                &model_text,
+                parse_tool_calls(&model_text),
+            )?;
+            let output_text = if tool_calls.is_empty() {
+                model_text.as_str()
+            } else {
+                ""
+            };
+            let output = if tool_calls.is_empty() {
+                if request.tool_choice.requires_tool() {
+                    return Err(AdapterError::InvalidRequest(
+                        "tool_choice requires a tool call, but the upstream model returned text"
+                            .to_string(),
+                    ));
+                }
+                vec![responses::message_output_item(&model_text)]
+            } else {
+                let tool_calls = constrain_parallel_tool_calls(&request, tool_calls);
+                responses::function_call_items(&tool_calls)
+            };
+            let mut body = responses::response_from_output(&request, output, output_text);
             restore_external_model(&mut body, &external_model);
             body
         }
@@ -498,7 +1031,11 @@ async fn handle_value(
                 );
             }
             let model_text = upstream_response.text;
-            let tool_calls = parse_tool_calls(&model_text);
+            let tool_calls = apply_tool_choice_to_tool_calls(
+                &request,
+                &model_text,
+                parse_tool_calls(&model_text),
+            )?;
             let mut body = match mode {
                 WireMode::ChatCompletions => chat::response(&request, &model_text, &tool_calls),
                 WireMode::Messages => messages::response(&request, &model_text, &tool_calls),
@@ -651,122 +1188,40 @@ fn restore_external_model(body: &mut Value, external_model: &str) {
     }
 }
 
-async fn create_responses_body_with_auto_tools(
-    state: &AppState,
-    mut request: UnifiedRequest,
-    protocol: &str,
-    upstream_options: &UpstreamRequestOptions,
-) -> Result<Value, AdapterError> {
-    let mut output = Vec::new();
-    for _ in 0..MAX_AUTO_TOOL_ROUNDS {
-        let prompt = request.render_prompt_with_tool_protocol(protocol);
-        let upstream_response = state
-            .upstream
-            .complete(&request, &prompt, upstream_options)
-            .await?;
-        if let Some(reasoning) = upstream_response.reasoning.as_deref() {
-            tracing::debug!(
-                reasoning_chars = reasoning.chars().count(),
-                "upstream reasoning"
-            );
-        }
-        let model_text = upstream_response.text;
-        let tool_calls = parse_tool_calls(&model_text);
-        if tool_calls.is_empty() {
-            output.push(responses::message_output_item(&model_text));
-            return Ok(responses::response_from_output(
-                &request,
-                output,
-                &model_text,
-            ));
-        }
-
-        if !tool_calls.iter().all(|call| is_internal_tool(&call.name)) {
-            output.extend(responses::function_call_items(&tool_calls));
-            return Ok(responses::response_from_output(&request, output, ""));
-        }
-
-        output.extend(responses::function_call_items(&tool_calls));
-        for (call, tool_output) in execute_internal_tool_calls_parallel(state, &tool_calls).await? {
-            output.push(responses::function_call_output_item(&call.id, &tool_output));
-            request.messages.push(UnifiedMessage {
-                role: "assistant".to_string(),
-                content: vec![UnifiedContent::ToolUse {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: serde_json::from_str::<Value>(&call.arguments)
-                        .unwrap_or_else(|_| json!({})),
-                }],
-            });
-            request.messages.push(UnifiedMessage {
-                role: "user".to_string(),
-                content: vec![UnifiedContent::ToolResult {
-                    tool_use_id: call.id.clone(),
-                    content: tool_output,
-                    is_error: false,
-                }],
-            });
+fn apply_tool_choice_to_tool_calls(
+    request: &UnifiedRequest,
+    model_text: &str,
+    tool_calls: Vec<crate::types::ParsedToolCall>,
+) -> Result<Vec<crate::types::ParsedToolCall>, AdapterError> {
+    if tool_calls.is_empty() {
+        return Ok(tool_calls);
+    }
+    if !request.tool_choice.allows_tools() {
+        tracing::warn!(
+            model_text_chars = model_text.chars().count(),
+            "upstream emitted tool calls while tool_choice=none; treating output as plain text"
+        );
+        return Ok(Vec::new());
+    }
+    if let Some(required_name) = request.tool_choice.required_name() {
+        if !tool_calls.iter().all(|call| call.name == required_name) {
+            return Err(AdapterError::InvalidRequest(format!(
+                "model emitted a tool other than required function {required_name}"
+            )));
         }
     }
-
-    Err(AdapterError::InvalidRequest(format!(
-        "auto tool call limit exceeded after {MAX_AUTO_TOOL_ROUNDS} rounds"
-    )))
+    Ok(tool_calls)
 }
 
-fn is_internal_tool(name: &str) -> bool {
-    matches!(name.trim(), "get_overview" | "get_quote")
-}
-
-async fn execute_internal_tool_calls_parallel(
-    state: &AppState,
-    calls: &[ParsedToolCall],
-) -> Result<Vec<(ParsedToolCall, String)>, AdapterError> {
-    let mut handles = Vec::with_capacity(calls.len());
-    for (index, call) in calls.iter().cloned().enumerate() {
-        let state = state.clone();
-        handles.push(tokio::spawn(async move {
-            let output = execute_internal_tool_call(&state, &call).await?;
-            Ok::<_, AdapterError>((index, call, output))
-        }));
+fn constrain_parallel_tool_calls(
+    request: &UnifiedRequest,
+    tool_calls: Vec<crate::types::ParsedToolCall>,
+) -> Vec<crate::types::ParsedToolCall> {
+    if request.parallel_tool_calls {
+        tool_calls
+    } else {
+        tool_calls.into_iter().take(1).collect()
     }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let result = handle
-            .await
-            .map_err(|error| AdapterError::Upstream(format!("tool task join error: {error}")))??;
-        results.push(result);
-    }
-    results.sort_by_key(|(index, _, _)| *index);
-    Ok(results
-        .into_iter()
-        .map(|(_, call, output)| (call, output))
-        .collect())
-}
-
-async fn execute_internal_tool_call(
-    state: &AppState,
-    call: &ParsedToolCall,
-) -> Result<String, AdapterError> {
-    let args = serde_json::from_str::<Value>(&call.arguments).map_err(|error| {
-        AdapterError::InvalidRequest(format!(
-            "tool {} arguments must be valid JSON: {error}",
-            call.name
-        ))
-    })?;
-    let params = parse_market_overview_params(&args)?;
-    let result = state
-        .upstream
-        .fetch_market_overview(
-            &params.base_url,
-            &params.symbol,
-            &params.market,
-            &params.modules,
-        )
-        .await?;
-    serde_json::to_string(&result)
-        .map_err(|error| AdapterError::Upstream(format!("serialize tool result: {error}")))
 }
 
 fn prepend_previous_response_context(
@@ -818,8 +1273,10 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use axum::http::HeaderMap;
+    use serde_json::json;
 
-    use super::upstream_options_from_headers;
+    use super::{apply_tool_choice_to_tool_calls, upstream_options_from_headers};
+    use crate::types::{ParsedToolCall, ToolChoice, UnifiedRequest};
 
     #[test]
     fn extracts_per_request_upstream_options() {
@@ -841,5 +1298,34 @@ mod tests {
         );
         assert_eq!(options.api_key.as_deref(), Some("secret"));
         assert_eq!(options.deepseek_session.as_deref(), Some("cookie=a"));
+    }
+
+    #[test]
+    fn tool_choice_none_suppresses_model_emitted_tool_calls() {
+        let request = UnifiedRequest {
+            model: "m".to_string(),
+            max_tokens: 16,
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::None,
+            parallel_tool_calls: false,
+            stream: false,
+            background: false,
+            previous_response_id: None,
+        };
+
+        let calls = apply_tool_choice_to_tool_calls(
+            &request,
+            "<tool_call name=\"search\">{}</tool_call>",
+            vec![ParsedToolCall {
+                id: "call_a".to_string(),
+                name: "search".to_string(),
+                arguments: json!({}).to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert!(calls.is_empty());
     }
 }

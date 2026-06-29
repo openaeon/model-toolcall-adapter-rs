@@ -36,6 +36,11 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let tools = chat::parse_tools(payload.get("tools"));
+    let tool_choice = chat::parse_tool_choice(payload.get("tool_choice"));
+    let parallel_tool_calls = payload
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let messages = payload.get("input").map(parse_input).unwrap_or_default();
 
     Ok(UnifiedRequest {
@@ -44,6 +49,8 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         system,
         messages,
         tools,
+        tool_choice,
+        parallel_tool_calls,
         stream,
         background,
         previous_response_id,
@@ -86,10 +93,10 @@ pub(crate) fn response_from_output(
         "model": request.model,
         "output": output,
         "output_text": output_text,
-        "parallel_tool_calls": true,
+        "parallel_tool_calls": request.parallel_tool_calls,
         "previous_response_id": request.previous_response_id,
         "store": true,
-        "tool_choice": "auto",
+        "tool_choice": request.tool_choice.to_wire_value(),
         "tools": response_tools(&request.tools),
         "truncation": "disabled",
         "usage": null
@@ -120,15 +127,6 @@ pub(crate) fn function_call_items(tool_calls: &[ParsedToolCall]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-pub(crate) fn function_call_output_item(call_id: &str, output: &str) -> Value {
-    json!({
-        "id": format!("fco_{}", Uuid::new_v4()),
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": output
-    })
 }
 
 fn response_tools(tools: &[ToolDefinition]) -> Value {
@@ -373,6 +371,20 @@ mod tests {
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["name"], "search");
+    }
+
+    #[test]
+    fn parses_tool_choice_and_parallel_flag() {
+        let request = parse_request(json!({
+            "model": "m",
+            "input": "hi",
+            "parallel_tool_calls": true,
+            "tool_choice": {"type":"function","name":"search"}
+        }))
+        .unwrap();
+
+        assert!(request.parallel_tool_calls);
+        assert_eq!(request.tool_choice.required_name(), Some("search"));
     }
 
     #[test]

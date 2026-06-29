@@ -1,12 +1,13 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::error::AdapterError;
+use crate::providers::{self, openai_compat::OpenAiCompatClient};
 use crate::types::UnifiedRequest;
 
 #[derive(Debug, Clone)]
@@ -17,9 +18,7 @@ pub struct UpstreamResponse {
 
 #[derive(Clone)]
 pub struct OpenAiChatUpstream {
-    client: Client,
-    base_url: String,
-    api_key: String,
+    openai_compat: OpenAiCompatClient,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -30,17 +29,53 @@ pub struct UpstreamRequestOptions {
     pub deepseek_session: Option<String>,
 }
 
+impl UpstreamRequestOptions {
+    pub fn redacted(&self) -> RedactedUpstreamRequestOptions<'_> {
+        RedactedUpstreamRequestOptions {
+            provider: self.provider.as_deref(),
+            base_url: self.base_url.as_deref(),
+            api_key_present: self
+                .api_key
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+            deepseek_session_present: self
+                .deepseek_session
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
+        }
+    }
+}
+
+pub struct RedactedUpstreamRequestOptions<'a> {
+    pub provider: Option<&'a str>,
+    pub base_url: Option<&'a str>,
+    pub api_key_present: bool,
+    pub deepseek_session_present: bool,
+}
+
+impl fmt::Debug for RedactedUpstreamRequestOptions<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RedactedUpstreamRequestOptions")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_key_present", &self.api_key_present)
+            .field("deepseek_session_present", &self.deepseek_session_present)
+            .finish()
+    }
+}
+
 impl OpenAiChatUpstream {
     pub fn new(config: &AppConfig) -> Result<Self, AdapterError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .map_err(|error| AdapterError::Upstream(error.to_string()))?;
-        Ok(Self {
-            client,
-            base_url: config.upstream_base_url.trim_end_matches('/').to_string(),
-            api_key: config.upstream_api_key.clone(),
-        })
+        let openai_compat = OpenAiCompatClient::new(
+            client.clone(),
+            config.upstream_base_url.clone(),
+            config.upstream_api_key.clone(),
+        );
+        Ok(Self { openai_compat })
     }
 
     pub async fn complete(
@@ -49,64 +84,7 @@ impl OpenAiChatUpstream {
         prompt: &str,
         options: &UpstreamRequestOptions,
     ) -> Result<UpstreamResponse, AdapterError> {
-        if request.model.starts_with("deepseek-web/")
-            || options
-                .provider
-                .as_deref()
-                .is_some_and(|provider| provider.eq_ignore_ascii_case("deepseek-web"))
-        {
-            return self.deepseek_web_complete(request, prompt, options).await;
-        }
-
-        let base_url = self.effective_base_url(options);
-        let api_key = self.effective_api_key(options);
-        let endpoint = chat_completions_endpoint(&base_url);
-        let body = json!({
-            "model": request.model,
-            "stream": false,
-            "max_tokens": request.max_tokens,
-            "messages": [{ "role": "user", "content": prompt }]
-        });
-        let mut builder = self.client.post(endpoint).json(&body);
-        if !api_key.trim().is_empty() {
-            builder = builder.bearer_auth(api_key);
-        }
-        let response = builder
-            .send()
-            .await
-            .map_err(|error| AdapterError::Upstream(error.to_string()))?;
-        let status = response.status();
-        let payload = response
-            .json::<Value>()
-            .await
-            .map_err(|error| AdapterError::Upstream(error.to_string()))?;
-        if !status.is_success() {
-            return Err(AdapterError::Upstream(payload.to_string()));
-        }
-        let text = payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                payload
-                    .get("response")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .ok_or_else(|| AdapterError::Upstream(format!("missing assistant text: {payload}")))?;
-
-        let reasoning = payload
-            .pointer("/choices/0/message/reasoning_content")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                payload
-                    .pointer("/choices/0/message/reasoning")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            });
-
-        Ok(UpstreamResponse { text, reasoning })
+        providers::complete(request, prompt, options, &self.openai_compat).await
     }
 
     pub async fn list_models(
@@ -115,282 +93,6 @@ impl OpenAiChatUpstream {
         model_aliases: &HashMap<String, String>,
         options: &UpstreamRequestOptions,
     ) -> Result<Value, AdapterError> {
-        if fallback_model.starts_with("deepseek-web/")
-            || options
-                .provider
-                .as_deref()
-                .is_some_and(|provider| provider.eq_ignore_ascii_case("deepseek-web"))
-        {
-            let mut data = vec![
-                json!({ "id": "deepseek-web/reasoner", "object": "model", "owned_by": "deepseek-web" }),
-                json!({ "id": "deepseek-web/chat", "object": "model", "owned_by": "deepseek-web" }),
-            ];
-            data.extend(alias_model_items(model_aliases));
-            return Ok(json!({ "object": "list", "data": data }));
-        }
-
-        let base_url = self.effective_base_url(options);
-        let api_key = self.effective_api_key(options);
-        let endpoint = models_endpoint(&base_url);
-        let mut builder = self.client.get(endpoint);
-        if !api_key.trim().is_empty() {
-            builder = builder.bearer_auth(api_key);
-        }
-        let response = match builder.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                return Ok(fallback_models(
-                    fallback_model,
-                    model_aliases,
-                    error.to_string(),
-                ))
-            }
-        };
-        let status = response.status();
-        let payload = match response.json::<Value>().await {
-            Ok(payload) => payload,
-            Err(error) => {
-                return Ok(fallback_models(
-                    fallback_model,
-                    model_aliases,
-                    error.to_string(),
-                ))
-            }
-        };
-        if status.is_success() {
-            return Ok(with_alias_models(payload, model_aliases));
-        }
-        Ok(fallback_models(
-            fallback_model,
-            model_aliases,
-            payload.to_string(),
-        ))
+        providers::list_models(fallback_model, model_aliases, options, &self.openai_compat).await
     }
-
-    pub async fn fetch_market_overview(
-        &self,
-        base_url: &str,
-        symbol: &str,
-        market: &str,
-        modules: &[String],
-    ) -> Result<Value, AdapterError> {
-        let endpoint = market_overview_endpoint(base_url);
-        let modules_csv = modules.join(",");
-        let mut last_error = None;
-        let response = 'retry: {
-            for attempt in 1..=3 {
-                match self
-                    .client
-                    .get(&endpoint)
-                    .query(&[
-                        ("symbol", symbol),
-                        ("market", market),
-                        ("modules", modules_csv.as_str()),
-                    ])
-                    .send()
-                    .await
-                {
-                    Ok(response) => break 'retry response,
-                    Err(error) => {
-                        last_error = Some(error.to_string());
-                        if attempt < 3 {
-                            tokio::time::sleep(Duration::from_millis(250 * attempt)).await;
-                        }
-                    }
-                }
-            }
-            return Err(AdapterError::Upstream(format!(
-                "market overview request failed after retries: endpoint={endpoint}, symbol={symbol}, market={market}, modules={modules_csv}, error={}",
-                last_error.unwrap_or_else(|| "unknown request error".to_string())
-            )));
-        };
-        let status = response.status();
-        let payload = response.json::<Value>().await.map_err(|error| {
-            AdapterError::Upstream(format!(
-                "market overview response json: endpoint={endpoint}, error={error}"
-            ))
-        })?;
-        if !status.is_success() {
-            return Err(AdapterError::Upstream(format!(
-                "market overview returned HTTP {status}: endpoint={endpoint}, body={payload}"
-            )));
-        }
-        Ok(payload)
-    }
-
-    async fn deepseek_web_complete(
-        &self,
-        request: &UnifiedRequest,
-        prompt: &str,
-        options: &UpstreamRequestOptions,
-    ) -> Result<UpstreamResponse, AdapterError> {
-        let session = raw_deepseek_session_from_options(options)?;
-        let client = crate::deepseek_web::DeepSeekWebClient::new(session);
-        let response = client
-            .complete(&request.model, prompt)
-            .await
-            .map_err(|error| {
-                let text = error.to_string();
-                if is_deepseek_auth_error(&text) {
-                    deepseek_session_expired_error()
-                } else {
-                    AdapterError::Upstream(format!("deepseek web provider: {text}"))
-                }
-            })?;
-
-        if response.text.trim().is_empty()
-            && response
-                .reasoning
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default()
-                .is_empty()
-        {
-            return Err(AdapterError::Upstream(
-                "deepseek web provider returned empty text and reasoning".to_string(),
-            ));
-        }
-        let text = clean_deepseek_output(&response.text);
-        let reasoning = response.reasoning;
-        Ok(UpstreamResponse { text, reasoning })
-    }
-
-    fn effective_base_url(&self, options: &UpstreamRequestOptions) -> String {
-        options
-            .base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&self.base_url)
-            .trim_end_matches('/')
-            .to_string()
-    }
-
-    fn effective_api_key<'a>(&'a self, options: &'a UpstreamRequestOptions) -> &'a str {
-        options
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&self.api_key)
-    }
-}
-
-fn raw_deepseek_session_from_options(
-    options: &UpstreamRequestOptions,
-) -> Result<String, AdapterError> {
-    options
-        .deepseek_session
-        .as_deref()
-        .or(options.api_key.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(read_default_deepseek_session)
-        .ok_or_else(|| {
-            AdapterError::Upstream(
-                "DeepSeek Web session missing. Paste session JSON/Cookie or save one to ~/.model-toolcall-adapter/deepseek_session.json.".to_string(),
-            )
-        })
-}
-
-fn read_default_deepseek_session() -> Option<String> {
-    let path = default_deepseek_session_path().ok()?;
-    std::fs::read_to_string(path).ok()
-}
-
-pub fn default_deepseek_session_path() -> Result<PathBuf, AdapterError> {
-    if let Some(path) = std::env::var_os("ADAPTER_DEEPSEEK_SESSION_FILE") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| AdapterError::Upstream("HOME is not set".to_string()))?;
-    Ok(PathBuf::from(home)
-        .join(".model-toolcall-adapter")
-        .join("deepseek_session.json"))
-}
-
-fn clean_deepseek_output(text: &str) -> String {
-    text.trim_end_matches("FINISHED").trim_end().to_string()
-}
-
-fn is_deepseek_auth_error(text: &str) -> bool {
-    text.contains("Authorization Failed")
-        || text.contains("invalid token")
-        || text.contains("\"code\":40003")
-}
-
-fn deepseek_session_expired_error() -> AdapterError {
-    AdapterError::Upstream(
-        "DeepSeek Web session invalid or expired. Re-login DeepSeek Web and refresh ~/.model-toolcall-adapter/deepseek_session.json, or paste a fresh session JSON/Cookie in the UI.".to_string(),
-    )
-}
-
-fn chat_completions_endpoint(base_url: &str) -> String {
-    let lower = base_url.to_ascii_lowercase();
-    if lower.ends_with("/chat/completions") {
-        base_url.to_string()
-    } else if lower.ends_with("/v1") {
-        format!("{base_url}/chat/completions")
-    } else {
-        format!("{base_url}/v1/chat/completions")
-    }
-}
-
-fn models_endpoint(base_url: &str) -> String {
-    let lower = base_url.to_ascii_lowercase();
-    if lower.ends_with("/models") {
-        base_url.to_string()
-    } else if lower.ends_with("/v1") {
-        format!("{base_url}/models")
-    } else {
-        format!("{base_url}/v1/models")
-    }
-}
-
-fn market_overview_endpoint(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/overview") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/overview")
-    }
-}
-
-fn alias_model_items(model_aliases: &HashMap<String, String>) -> Vec<Value> {
-    model_aliases
-        .keys()
-        .map(|alias| {
-            json!({
-                "id": alias,
-                "object": "model",
-                "owned_by": "adapter-alias"
-            })
-        })
-        .collect()
-}
-
-fn with_alias_models(mut payload: Value, model_aliases: &HashMap<String, String>) -> Value {
-    if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
-        data.extend(alias_model_items(model_aliases));
-    }
-    payload
-}
-
-fn fallback_models(
-    fallback_model: &str,
-    model_aliases: &HashMap<String, String>,
-    warning: impl Into<String>,
-) -> Value {
-    let mut data = vec![json!({
-        "id": fallback_model,
-        "object": "model",
-        "owned_by": "adapter-fallback"
-    })];
-    data.extend(alias_model_items(model_aliases));
-    json!({
-        "object": "list",
-        "data": data,
-        "warning": warning.into()
-    })
 }

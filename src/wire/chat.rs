@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::error::AdapterError;
 use crate::types::{
-    ParsedToolCall, ToolDefinition, UnifiedContent, UnifiedMessage, UnifiedRequest,
+    ParsedToolCall, ToolChoice, ToolDefinition, UnifiedContent, UnifiedMessage, UnifiedRequest,
 };
 
 pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
@@ -23,6 +23,11 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let tools = parse_tools(payload.get("tools"));
+    let tool_choice = parse_tool_choice(payload.get("tool_choice"));
+    let parallel_tool_calls = payload
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut system = None;
     let mut messages = Vec::new();
 
@@ -73,6 +78,8 @@ pub fn parse_request(payload: Value) -> Result<UnifiedRequest, AdapterError> {
         system,
         messages,
         tools,
+        tool_choice,
+        parallel_tool_calls,
         stream,
         background: false,
         previous_response_id: None,
@@ -223,6 +230,26 @@ pub(crate) fn parse_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
             })
         })
         .collect()
+}
+
+pub(crate) fn parse_tool_choice(value: Option<&Value>) -> ToolChoice {
+    match value {
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("none") => ToolChoice::None,
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("required") => {
+            ToolChoice::Required
+        }
+        Some(Value::String(value)) if value.eq_ignore_ascii_case("auto") => ToolChoice::Auto,
+        Some(Value::Object(object)) => object
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .or_else(|| object.get("name"))
+            .and_then(Value::as_str)
+            .map(|name| ToolChoice::Function {
+                name: name.to_string(),
+            })
+            .unwrap_or(ToolChoice::Auto),
+        _ => ToolChoice::Auto,
+    }
 }
 
 pub(crate) fn extract_chat_content(value: Option<&Value>) -> String {

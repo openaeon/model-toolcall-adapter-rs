@@ -19,7 +19,7 @@ The goal is practical compatibility with mainstream programming agents and edito
 - Parses XML, JSON, and tolerant tool-call formats from plain model output.
 - Supports OpenAI-compatible upstreams such as local Ollama/vLLM/LM Studio-style APIs.
 - Includes a DeepSeek Web upstream provider with local session storage, PoW handling, SSE parsing, and reasoning/text separation.
-- Includes a compact browser UI at `/ui` for debugging models, tools, and Responses flows.
+- Includes a setup wizard at `/ui` for provider selection, adapter key generation, DeepSeek Web login, and bridge configuration.
 
 The project is now standalone. It does not depend on `../crates/aeon-claw-api`, `aeon-claw-cli`, or the FCACoreai workspace at build time or runtime.
 
@@ -66,7 +66,7 @@ The core modules are intentionally small:
 - `src/wire/*` converts request and response wire formats.
 - `src/protocol/mod.rs` renders the text tool protocol and parses tool calls.
 - `src/upstream.rs` routes to OpenAI-compatible and DeepSeek Web upstreams.
-- `src/deepseek_web.rs` implements the standalone DeepSeek Web client.
+- `src/providers/deepseek_web/` implements the standalone DeepSeek Web provider, session handling, PoW, and SSE parsing.
 - `src/responses_store.rs` keeps in-memory Responses state for retrieve, input-items, cancel, and continuation flows.
 
 ## Quick Start
@@ -88,16 +88,41 @@ Open the built-in UI:
 http://127.0.0.1:8787/ui
 ```
 
-Then use:
+On first startup, the adapter creates:
 
-- Adapter API: `http://127.0.0.1:8787`
-- Adapter API Key: `local-dev-key`
-- Upstream API Base URL: your OpenAI-compatible model endpoint
-- Model: either the upstream model name or an alias configured with `ADAPTER_MODEL_ALIASES`
+```text
+~/.model-toolcall-adapter/config.json
+```
+
+with a random `adapter_api_key`. Open `/ui` and follow the wizard:
+
+- Step 1: choose `openai-compatible` or `deepseek-web`.
+- Step 2: for DeepSeek Web, log in through the controlled browser profile opened by the adapter.
+- Step 3: copy the Base URL, Adapter Key, model, and request examples into your client, or write Codex config with one click.
+
+## One-click Codex Setup
+
+The setup wizard's "Configure Codex" action:
+
+- Backs up `~/.codex/config.toml` and `~/.codex/auth.json`.
+- Writes the adapter model selection near the top of `config.toml` and the provider table near the end.
+- Writes the current random `adapter_api_key` to `auth.json` as `OPENAI_API_KEY`.
+
+The generated provider uses the Codex-supported Responses wire:
+
+```toml
+[model_providers.ModelToolCallAdapter]
+name = "ModelToolCallAdapter"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+Restart Codex CLI/app after writing the config.
 
 ## Configuration
 
-Every CLI flag also has an environment variable.
+Every CLI flag also has an environment variable. Explicit CLI/env values override the local config file.
 
 ```bash
 export ADAPTER_BIND=127.0.0.1:8787
@@ -109,6 +134,14 @@ export ADAPTER_API_KEY=local-dev-key
 export ADAPTER_DEEPSEEK_SESSION_FILE=~/.model-toolcall-adapter/deepseek_session.json
 cargo run
 ```
+
+If `ADAPTER_API_KEY` is not set, the adapter reads or creates:
+
+```text
+~/.model-toolcall-adapter/config.json
+```
+
+and uses its random `adapter_api_key` to protect the API.
 
 `ADAPTER_MODEL_ALIASES` is a comma-separated mapping:
 
@@ -126,7 +159,7 @@ Clients may request `model: "gpt-5-codex"`, while the adapter sends the request 
 
 ## Authentication
 
-If `ADAPTER_API_KEY` is empty, adapter endpoints do not require authentication.
+If both `ADAPTER_API_KEY` and the local `adapter_api_key` are empty, adapter endpoints do not require authentication.
 
 If it is set, pass either:
 
@@ -167,11 +200,13 @@ Set `ADAPTER_DEEPSEEK_SESSION_FILE` to use a different path.
 
 DeepSeek Web support is fully local to this repository.
 
-The UI can open the DeepSeek login page from `/deepseek-web/login`. After login, paste a Session JSON/Cookie into the UI and click "login/fetch models"; the adapter saves it to:
+The UI starts an isolated browser profile from `/setup/deepseek-browser/start` with a DevTools debugging port. After the user logs in to DeepSeek Web in that controlled browser, the UI can capture usable DeepSeek cookie/localStorage credentials and save them to:
 
 ```text
 ~/.model-toolcall-adapter/deepseek_session.json
 ```
+
+If Chrome, Edge, Chromium, or Brave cannot be found, or if the debugging port is unavailable, the UI keeps a manual Session JSON/Cookie fallback.
 
 The saved object can contain:
 
@@ -192,7 +227,7 @@ DeepSeek Web is an unofficial web upstream. If the web service changes its priva
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Health check |
-| `GET /ui` | Built-in debug UI |
+| `GET /ui` | Built-in setup wizard |
 | `GET /v1/models` | List upstream and alias models |
 | `POST /v1/chat/completions` | OpenAI Chat Completions-compatible request |
 | `POST /v1/messages` | Anthropic Messages-style request |
@@ -201,6 +236,11 @@ DeepSeek Web is an unofficial web upstream. If the web service changes its priva
 | `GET /v1/responses/{response_id}/input_items` | List stored response input items |
 | `POST /v1/responses/{response_id}/cancel` | Cancel background response |
 | `POST /v1/responses/compact` | Compact response context |
+| `GET /setup/state` | Read setup wizard state and local config |
+| `POST /setup/provider` | Save provider selection |
+| `POST /setup/deepseek-browser/start` | Start the controlled DeepSeek Web login browser |
+| `POST /setup/deepseek-browser/capture` | Capture and save DeepSeek session from the controlled browser |
+| `POST /setup/codex/apply` | Backup and write Codex config/auth |
 | `POST /deepseek-web/login` | Open DeepSeek login page |
 | `POST /deepseek-web/session` | Save DeepSeek session locally |
 
@@ -303,14 +343,11 @@ curl http://127.0.0.1:8787/v1/responses \
 
 The adapter stitches prior input, prior model output, and the new tool result into the next upstream prompt.
 
-## Built-in Tools
+## Tool Execution Boundary
 
-The adapter can automatically execute a small set of internal tools in Responses mode:
+The adapter does not execute business tools by default.
 
-- `get_overview`
-- `get_quote`
-
-These are intended for local testing of closed-loop behavior. Production tool execution should usually live in the calling agent runtime.
+Its job is to turn user-provided tool schemas into model-readable instructions, parse plain model text back into standard tool calls, and accept `function_call_output` items from the caller for continuation. Your agent runtime, application server, or client should execute the actual tools and send the results back.
 
 ## Development
 
@@ -329,7 +366,7 @@ Implemented:
 - Non-streaming Chat Completions, Messages, and Responses compatibility.
 - Responses create, retrieve, input-items, cancel, and compact endpoints.
 - `previous_response_id` continuation.
-- Top-level Responses `function_call` and `function_call_output` loops.
+- Top-level Responses `function_call` output and `function_call_output` continuation.
 - Model aliases.
 - Adapter API-key authentication.
 - Per-request upstream base URL and API-key overrides.
@@ -341,8 +378,7 @@ Not yet implemented:
 - Streaming output.
 - Full browser cookie extraction for DeepSeek Web login.
 - Durable response storage beyond process memory.
-- Full `tool_choice` behavior.
-- Production-grade tool execution sandboxing.
+- More complete `tool_choice` edge cases.
 
 ## License
 

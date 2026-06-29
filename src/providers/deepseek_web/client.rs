@@ -292,7 +292,7 @@ impl DeepSeekWebClient {
     }
 
     fn solve_pow(challenge: &Value) -> Result<Value, AdapterError> {
-        let script_content = include_str!("deepseek_pow_solver.js");
+        let script_content = include_str!("pow_solver.js");
         let temp_script =
             std::env::temp_dir().join("model_toolcall_adapter_deepseek_pow_solver.js");
         std::fs::write(&temp_script, script_content)

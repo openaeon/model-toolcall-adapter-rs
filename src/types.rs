@@ -11,6 +11,8 @@ pub struct UnifiedRequest {
     pub system: Option<String>,
     pub messages: Vec<UnifiedMessage>,
     pub tools: Vec<ToolDefinition>,
+    pub tool_choice: ToolChoice,
+    pub parallel_tool_calls: bool,
     pub stream: bool,
     pub background: bool,
     pub previous_response_id: Option<String>,
@@ -35,7 +37,10 @@ impl UnifiedRequest {
             sections.push(format!("<system>\n{system}\n</system>"));
         }
         if !self.tools.is_empty() {
-            sections.push(format!("<tool_protocol>\n{protocol}\n</tool_protocol>"));
+            sections.push(format!(
+                "<tool_protocol>\n{}\n</tool_protocol>",
+                render_tool_choice_prompt(protocol, &self.tool_choice, self.parallel_tool_calls)
+            ));
         }
         for message in &self.messages {
             sections.push(format!("{}: {}", message.role, message.content_text()));
@@ -114,9 +119,79 @@ pub struct ToolDefinition {
     pub input_schema: Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Function { name: String },
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+impl ToolChoice {
+    pub fn allows_tools(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    pub fn requires_tool(&self) -> bool {
+        matches!(self, Self::Required | Self::Function { .. })
+    }
+
+    pub fn required_name(&self) -> Option<&str> {
+        match self {
+            Self::Function { name } => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn to_wire_value(&self) -> Value {
+        match self {
+            Self::Auto => Value::String("auto".to_string()),
+            Self::None => Value::String("none".to_string()),
+            Self::Required => Value::String("required".to_string()),
+            Self::Function { name } => serde_json::json!({
+                "type": "function",
+                "name": name,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+}
+
+fn render_tool_choice_prompt(protocol: &str, tool_choice: &ToolChoice, parallel: bool) -> String {
+    let mut prompt = protocol.to_string();
+    match tool_choice {
+        ToolChoice::Auto => {
+            prompt.push_str("\nTool choice: auto. Use a tool only when it is needed.");
+        }
+        ToolChoice::None => {
+            prompt.push_str("\nTool choice: none. Do not call tools. Answer directly.");
+        }
+        ToolChoice::Required => {
+            prompt.push_str("\nTool choice: required. You must call one available tool.");
+        }
+        ToolChoice::Function { name } => {
+            prompt.push_str(&format!(
+                "\nTool choice: required function `{name}`. You must call this tool name exactly."
+            ));
+        }
+    }
+    if parallel {
+        prompt.push_str("\nParallel tool calls: allowed when independent.");
+    } else {
+        prompt.push_str("\nParallel tool calls: disabled. Emit at most one tool call.");
+    }
+    prompt
 }

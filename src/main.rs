@@ -1,8 +1,8 @@
 mod config;
-mod deepseek_web;
 mod error;
 mod http;
 mod protocol;
+mod providers;
 mod responses_store;
 mod types;
 mod ui;
@@ -20,6 +20,6 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = AppConfig::parse();
+    let config = AppConfig::parse().load_or_init()?;
     http::serve(config).await
 }

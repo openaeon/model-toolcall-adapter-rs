@@ -78,18 +78,25 @@ model-toolcall-adapter-rs
 ```bash
 git clone https://github.com/openaeon/model-toolcall-adapter-rs.git
 cd model-toolcall-adapter-rs
-cargo run -- \
-  --bind 127.0.0.1:8787 \
-  --upstream-base-url http://127.0.0.1:11434/v1 \
-  --upstream-model qwen3-coder \
-  --model-aliases codex-adapter=qwen3-coder \
-  --adapter-api-key local-dev-key
+cargo run
 ```
 
 打开内置 UI：
 
 ```text
 http://127.0.0.1:8787/ui
+```
+
+如果 `8787` 端口被占用：
+
+```bash
+ADAPTER_BIND=127.0.0.1:8899 cargo run
+```
+
+然后打开：
+
+```text
+http://127.0.0.1:8899/ui
 ```
 
 首次启动会自动创建本地配置：
@@ -103,6 +110,16 @@ http://127.0.0.1:8787/ui
 - 第一步选择供应商：`openai-compatible` 或 `deepseek-web`。
 - 第二步 DeepSeek Web 会启动独立浏览器 profile 登录，并从这个受控浏览器捕获 session。
 - 第三步展示 Base URL、Adapter Key、模型名和请求示例，也可以一键写入 Codex 配置。
+
+如果要直接指定 OpenAI-compatible 上游，也可以用：
+
+```bash
+cargo run -- \
+  --bind 127.0.0.1:8787 \
+  --upstream-base-url http://127.0.0.1:11434/v1 \
+  --upstream-model qwen3-coder \
+  --model-aliases codex-adapter=qwen3-coder
+```
 
 ## Codex 一键配置
 
@@ -123,6 +140,8 @@ requires_openai_auth = true
 ```
 
 如果 Codex CLI/app 已经在运行，配置后需要重启。
+
+如果 Codex 桌面端提示“无法更新模型设置”，先打开 `/ui` 第三步点击“一键配置 Codex”，再检查 `~/.codex/config.toml` 顶部是否已经写入 `model_provider = "ModelToolCallAdapter"`，以及 `~/.codex/auth.json` 里的 `OPENAI_API_KEY` 是否为 `adp_` 开头的 adapter key。受控 Chrome 偶尔输出 `Registration URL fetching failed`、`DEPRECATED_ENDPOINT`、`ConnectionHandler failed with net error` 这类 GCM/后台联网日志，通常只是 Chrome 自身服务噪声，不代表 DeepSeek session 捕获失败。
 
 ## 配置
 

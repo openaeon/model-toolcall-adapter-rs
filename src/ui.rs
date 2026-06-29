@@ -3,6 +3,7 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
   <title>Model Tool Call Adapter Setup</title>
   <style>
     :root {
@@ -113,6 +114,12 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     .kv:last-child { border-bottom: 0; }
     .key { color: var(--muted); }
     .value { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .cmd {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: start;
+    }
     @media (max-width: 820px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -135,6 +142,16 @@ pub const INDEX_HTML: &str = r#"<!doctype html>
     </aside>
     <section>
       <div id="step1" class="step active">
+        <div class="panel">
+          <h2>启动命令</h2>
+          <p>在项目目录运行服务，然后打开本页完成配置。</p>
+          <div class="cmd">
+            <pre id="startCommand">cd /Users/opnclaw/Documents/GitHub/model-toolcall-adapter-rs
+cargo run</pre>
+            <button id="copyStartCommand" class="secondary">复制</button>
+          </div>
+          <div class="status">默认地址：<code>http://127.0.0.1:8787/ui</code>。端口占用时可用 <code>ADAPTER_BIND=127.0.0.1:8899 cargo run</code>。</div>
+        </div>
         <div class="panel">
           <h2>选择模型供应商</h2>
           <p>这个选择会写入本地配置文件。后续请求仍然可以用 header 覆盖。</p>
@@ -390,6 +407,11 @@ requires_openai_auth = true
       setStatus("bridgeStatus", "Key 已复制", "ok");
     }
 
+    async function copyStartCommand() {
+      await navigator.clipboard.writeText($("startCommand").textContent.trim());
+      setStatus("providerStatus", "启动命令已复制", "ok");
+    }
+
     async function configureCodex() {
       setStatus("bridgeStatus", "正在写入 ~/.codex/config.toml 和 auth.json...");
       $("configureCodex").disabled = true;
@@ -421,6 +443,7 @@ requires_openai_auth = true
     $("saveManualSession").addEventListener("click", () => saveManualSession().catch((err) => setStatus("manualStatus", err.message || String(err), "bad")));
     $("fetchModels").addEventListener("click", fetchModels);
     $("copyKey").addEventListener("click", copyKey);
+    $("copyStartCommand").addEventListener("click", copyStartCommand);
     $("configureCodex").addEventListener("click", configureCodex);
 
     loadState()

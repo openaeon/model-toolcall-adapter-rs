@@ -78,18 +78,25 @@ The core modules are intentionally small:
 ```bash
 git clone https://github.com/openaeon/model-toolcall-adapter-rs.git
 cd model-toolcall-adapter-rs
-cargo run -- \
-  --bind 127.0.0.1:8787 \
-  --upstream-base-url http://127.0.0.1:11434/v1 \
-  --upstream-model qwen3-coder \
-  --model-aliases codex-adapter=qwen3-coder \
-  --adapter-api-key local-dev-key
+cargo run
 ```
 
 Open the built-in UI:
 
 ```text
 http://127.0.0.1:8787/ui
+```
+
+If port `8787` is already in use:
+
+```bash
+ADAPTER_BIND=127.0.0.1:8899 cargo run
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8899/ui
 ```
 
 On first startup, the adapter creates:
@@ -103,6 +110,16 @@ with a random `adapter_api_key`. Open `/ui` and follow the wizard:
 - Step 1: choose `openai-compatible` or `deepseek-web`.
 - Step 2: for DeepSeek Web, log in through the controlled browser profile opened by the adapter.
 - Step 3: copy the Base URL, Adapter Key, model, and request examples into your client, or write Codex config with one click.
+
+To start directly with an OpenAI-compatible upstream:
+
+```bash
+cargo run -- \
+  --bind 127.0.0.1:8787 \
+  --upstream-base-url http://127.0.0.1:11434/v1 \
+  --upstream-model qwen3-coder \
+  --model-aliases codex-adapter=qwen3-coder
+```
 
 ## One-click Codex Setup
 
@@ -123,6 +140,8 @@ requires_openai_auth = true
 ```
 
 Restart Codex CLI/app after writing the config.
+
+If the Codex desktop app says it cannot update model settings, open `/ui`, run Step 3's "Configure Codex", then check that `~/.codex/config.toml` starts with `model_provider = "ModelToolCallAdapter"` and that `~/.codex/auth.json` has an `OPENAI_API_KEY` starting with the adapter's `adp_` key. Controlled Chrome may print `Registration URL fetching failed`, `DEPRECATED_ENDPOINT`, or `ConnectionHandler failed with net error`; those are usually Chrome background/GCM noise, not a DeepSeek session capture failure.
 
 ## Configuration
 

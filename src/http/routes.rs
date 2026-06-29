@@ -105,8 +105,11 @@ pub async fn setup_deepseek_browser_start(
 
 pub async fn setup_deepseek_browser_capture(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<Value>,
+    payload: Option<Json<Value>>,
 ) -> Result<Json<Value>, AdapterError> {
+    let payload = payload
+        .map(|Json(payload)| payload)
+        .unwrap_or_else(|| json!({}));
     let port = payload
         .get("port")
         .and_then(Value::as_u64)
@@ -325,6 +328,14 @@ fn start_deepseek_browser() -> Result<DeepSeekBrowserProcess, AdapterError> {
         ))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
+        .arg("--disable-background-networking")
+        .arg("--disable-component-update")
+        .arg("--disable-domain-reliability")
+        .arg("--disable-features=OptimizationHints,AutofillServerCommunication,MediaRouter")
+        .arg("--disable-sync")
+        .arg("--disable-extensions")
+        .arg("--metrics-recording-only")
+        .arg("--safebrowsing-disable-auto-update")
         .arg("https://chat.deepseek.com/")
         .spawn()
         .map_err(|error| {
@@ -421,9 +432,27 @@ async fn capture_deepseek_session(port: u16) -> Result<String, AdapterError> {
         .into_iter()
         .flatten()
         .find(|tab| {
-            tab.get("url")
-                .and_then(Value::as_str)
-                .is_some_and(|url| url.contains("chat.deepseek.com"))
+            tab.get("type").and_then(Value::as_str) == Some("page")
+                && tab
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with("https://chat.deepseek.com"))
+        })
+        .or_else(|| {
+            tabs.as_array().into_iter().flatten().find(|tab| {
+                tab.get("type").and_then(Value::as_str) == Some("page")
+                    && tab
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .is_some_and(|url| url.contains("chat.deepseek.com"))
+            })
+        })
+        .or_else(|| {
+            tabs.as_array().into_iter().flatten().find(|tab| {
+                tab.get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.contains("chat.deepseek.com"))
+            })
         })
         .or_else(|| tabs.as_array().and_then(|tabs| tabs.first()))
         .ok_or_else(|| {
@@ -460,6 +489,25 @@ async fn capture_deepseek_session(port: u16) -> Result<String, AdapterError> {
     )
     .await
     .unwrap_or_else(|_| json!({}));
+    let user_agent = cdp_send(
+        &mut ws,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "navigator.userAgent",
+            "returnByValue": true
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|value| {
+        value
+            .pointer("/result/value")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+    .filter(|value| !value.trim().is_empty())
+    .unwrap_or_else(|| "Mozilla/5.0".to_string());
 
     let cookie_header = cookies
         .get("cookies")
@@ -497,7 +545,7 @@ async fn capture_deepseek_session(port: u16) -> Result<String, AdapterError> {
     Ok(json!({
         "cookie": cookie_header,
         "bearer": bearer,
-        "user_agent": "Mozilla/5.0",
+        "user_agent": user_agent,
         "local_storage_keys": storage_value.as_object().map(|object| object.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
     })
     .to_string())
@@ -543,17 +591,64 @@ where
 }
 
 fn find_deepseek_bearer(storage: &Value) -> Option<String> {
-    storage.as_object().and_then(|object| {
-        object.iter().find_map(|(key, value)| {
-            let key = key.to_ascii_lowercase();
-            let raw = value.as_str().unwrap_or_default();
-            if key.contains("token") || key.contains("auth") || raw.starts_with("eyJ") {
-                Some(raw.to_string())
-            } else {
-                None
-            }
-        })
+    let object = storage.as_object()?;
+    for key in ["userToken", "settingsJwt"] {
+        if let Some(token) = object
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(normalize_deepseek_auth_value)
+        {
+            return Some(token);
+        }
+    }
+
+    object.iter().find_map(|(key, value)| {
+        let key = key.to_ascii_lowercase();
+        if key.contains("apm")
+            || key.contains("tea")
+            || key.contains("aws")
+            || key.contains("smid")
+            || key.contains("cache")
+            || key.contains("challenge")
+        {
+            return None;
+        }
+        let raw = value.as_str().unwrap_or_default();
+        if raw.trim_start().starts_with("eyJ") || key.contains("token") || key.contains("auth") {
+            normalize_deepseek_auth_value(raw)
+        } else {
+            None
+        }
     })
+}
+
+fn normalize_deepseek_auth_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('{') {
+        return Some(trimmed.to_string());
+    }
+    let parsed = serde_json::from_str::<Value>(trimmed).ok()?;
+    find_auth_value_in_json(&parsed)
+}
+
+fn find_auth_value_in_json(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => normalize_deepseek_auth_value(raw),
+        Value::Object(object) => [
+            "token",
+            "access_token",
+            "jwt",
+            "value",
+            "userToken",
+            "settingsJwt",
+        ]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(find_auth_value_in_json)),
+        _ => None,
+    }
 }
 
 fn codex_home_dir() -> Result<PathBuf, AdapterError> {
@@ -654,7 +749,8 @@ fn replace_codex_managed_blocks(existing: &str, root_block: &str, provider_block
         "# BEGIN model-toolcall-adapter provider",
         "# END model-toolcall-adapter provider",
     );
-    let body = without_provider.trim();
+    let without_stale_root_keys = remove_codex_root_keys(&without_provider);
+    let body = without_stale_root_keys.trim();
     if body.is_empty() {
         format!(
             "{}\n\n{}\n",
@@ -685,6 +781,38 @@ fn remove_managed_block(existing: &str, begin: &str, end_marker: &str) -> String
         }
     }
     existing.to_string()
+}
+
+fn remove_codex_root_keys(existing: &str) -> String {
+    const ROOT_KEYS: &[&str] = &[
+        "model_provider",
+        "model",
+        "review_model",
+        "model_reasoning_effort",
+        "disable_response_storage",
+        "network_access",
+        "model_context_window",
+        "model_auto_compact_token_limit",
+    ];
+
+    let mut output = Vec::new();
+    let mut in_root = true;
+    for line in existing.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_root = false;
+        }
+        let is_managed_key = in_root
+            && ROOT_KEYS.iter().any(|key| {
+                trimmed
+                    .strip_prefix(key)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            });
+        if !is_managed_key {
+            output.push(line);
+        }
+    }
+    output.join("\n")
 }
 
 fn write_codex_auth(path: &FsPath, key: &str) -> Result<(), AdapterError> {
@@ -1275,7 +1403,10 @@ mod tests {
     use axum::http::HeaderMap;
     use serde_json::json;
 
-    use super::{apply_tool_choice_to_tool_calls, upstream_options_from_headers};
+    use super::{
+        apply_tool_choice_to_tool_calls, codex_managed_provider_block, codex_managed_root_block,
+        find_deepseek_bearer, replace_codex_managed_blocks, upstream_options_from_headers,
+    };
     use crate::types::{ParsedToolCall, ToolChoice, UnifiedRequest};
 
     #[test]
@@ -1327,5 +1458,48 @@ mod tests {
         .unwrap();
 
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn codex_config_replaces_stale_root_model_keys() {
+        let existing = r#"model_provider = "MyOpenAI"
+model = "gpt-5.5"
+review_model = "gpt-5.5"
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[features]
+goals = true
+
+[model_providers.MyOpenAI]
+name = "MyOpenAI"
+"#;
+
+        let next = replace_codex_managed_blocks(
+            existing,
+            &codex_managed_root_block("ModelToolCallAdapter", "deepseek-web/reasoner"),
+            &codex_managed_provider_block("ModelToolCallAdapter", "http://127.0.0.1:8787/v1"),
+        );
+
+        assert!(next.contains("model_provider = \"ModelToolCallAdapter\""));
+        assert!(next.contains("model = \"deepseek-web/reasoner\""));
+        assert!(next.contains("windows_wsl_setup_acknowledged = true"));
+        assert!(next.contains("[features]"));
+        assert!(next.contains("[model_providers.MyOpenAI]"));
+        assert!(!next.contains("model_provider = \"MyOpenAI\""));
+        assert!(!next.contains("model = \"gpt-5.5\""));
+    }
+
+    #[test]
+    fn deepseek_capture_prefers_user_token_value() {
+        let storage = json!({
+            "__tea_cache_tokens_20006317": "{\"web_id\":\"analytics\"}",
+            "settingsJwt": "{\"value\":{\"ownerHash\":\"not-login-token\"}}",
+            "userToken": "{\"value\":\"login-token-64\"}"
+        });
+
+        let bearer = find_deepseek_bearer(&storage);
+
+        assert_eq!(bearer.as_deref(), Some("login-token-64"));
     }
 }

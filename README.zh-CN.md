@@ -96,6 +96,8 @@ cd .\model-toolcall-adapter-rs-windows-x64-exe\model-toolcall-adapter-rs-windows
 .\model-toolcall-adapter-rs.exe
 ```
 
+Windows 终端不会自动从当前目录查找程序，所以必须带 `.\` 前缀。DeepSeek Web 常见 `sha256` PoW 已由 adapter 内置 Rust 实现处理，不需要用户额外安装 Node.js。
+
 macOS Apple Silicon：
 
 ```bash

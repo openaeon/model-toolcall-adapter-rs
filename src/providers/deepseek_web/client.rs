@@ -8,6 +8,7 @@ use base64::Engine;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -392,6 +393,14 @@ impl DeepSeekWebClient {
     }
 
     fn solve_pow(challenge: &Value) -> Result<Value, AdapterError> {
+        if challenge
+            .get("algorithm")
+            .and_then(Value::as_str)
+            .is_some_and(|algorithm| algorithm.eq_ignore_ascii_case("sha256"))
+        {
+            return solve_sha256_pow(challenge);
+        }
+
         let script_content = include_str!("pow_solver.js");
         let temp_script =
             std::env::temp_dir().join("model_toolcall_adapter_deepseek_pow_solver.js");
@@ -405,7 +414,8 @@ impl DeepSeekWebClient {
             .output()
             .map_err(|error| {
                 AdapterError::Upstream(format!(
-                    "failed to execute Node.js PoW solver. Install Node.js or put it on PATH: {error}"
+                    "failed to execute Node.js PoW solver for unsupported DeepSeek PoW algorithm. \
+Install Node.js or put it on PATH, or update the adapter: {error}"
                 ))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -595,6 +605,63 @@ async fn expect_success_response(
 
 fn node_command() -> &'static str {
     "node"
+}
+
+fn solve_sha256_pow(challenge: &Value) -> Result<Value, AdapterError> {
+    let target = challenge
+        .get("challenge")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AdapterError::Upstream("sha256 PoW challenge is missing challenge".into())
+        })?;
+    let salt = challenge
+        .get("salt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AdapterError::Upstream("sha256 PoW challenge is missing salt".into()))?;
+    let difficulty = challenge
+        .get("difficulty")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            AdapterError::Upstream("sha256 PoW challenge is missing difficulty".into())
+        })?;
+    let target_difficulty = if difficulty > 1000 {
+        (u64::BITS - 1 - difficulty.leading_zeros()) as u32
+    } else {
+        difficulty as u32
+    };
+
+    for nonce in 0_u64..=10_000_000 {
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{salt}{target}{nonce}").as_bytes());
+        let digest = hasher.finalize();
+        if leading_zero_bits(&digest) >= target_difficulty {
+            return Ok(json!({
+                "algorithm": "sha256",
+                "challenge": target,
+                "salt": salt,
+                "answer": nonce,
+                "signature": true,
+                "target_path": challenge.get("target_path").cloned().unwrap_or(Value::Null)
+            }));
+        }
+    }
+
+    Err(AdapterError::Upstream(
+        "sha256 PoW solver timeout after 10000000 attempts".into(),
+    ))
+}
+
+fn leading_zero_bits(bytes: &[u8]) -> u32 {
+    let mut total = 0;
+    for byte in bytes {
+        if *byte == 0 {
+            total += 8;
+        } else {
+            total += byte.leading_zeros();
+            break;
+        }
+    }
+    total
 }
 
 fn deepseek_model_type(model: &str) -> &'static str {
@@ -920,7 +987,9 @@ fn current_unix_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_middle_to_bytes;
+    use super::{leading_zero_bits, solve_sha256_pow, truncate_middle_to_bytes};
+    use serde_json::json;
+    use sha2::Digest;
 
     #[test]
     fn deepseek_prompt_truncation_preserves_head_and_latest_user_request() {
@@ -934,5 +1003,23 @@ mod tests {
         assert!(truncated.contains("<tool_protocol>must call tools</tool_protocol>"));
         assert!(truncated.contains("[truncated middle for deepseek web request budget]"));
         assert!(truncated.contains("user: 看看当前项目有什么问题"));
+    }
+
+    #[test]
+    fn solves_sha256_pow_without_node_runtime() {
+        let answer = solve_sha256_pow(&json!({
+            "algorithm": "sha256",
+            "challenge": "unit",
+            "salt": "test-",
+            "difficulty": 4,
+            "target_path": "/api/v0/chat/completion"
+        }))
+        .unwrap();
+
+        let nonce = answer["answer"].as_u64().unwrap();
+        let digest = sha2::Sha256::digest(format!("test-unit{nonce}").as_bytes());
+
+        assert_eq!(answer["algorithm"], "sha256");
+        assert!(leading_zero_bits(&digest) >= 4);
     }
 }

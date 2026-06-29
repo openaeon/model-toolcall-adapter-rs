@@ -2569,7 +2569,8 @@ fn combined_tool_parse_text(reasoning: Option<&str>, model_text: &str) -> String
 }
 
 fn clean_model_visible_text(text: &str) -> String {
-    let mut value = text.trim_end();
+    let stripped = strip_visible_tool_protocol_blocks(text);
+    let mut value = stripped.trim_end();
     loop {
         let Some(stripped) = value.strip_suffix("FINISHED") else {
             break;
@@ -2577,6 +2578,51 @@ fn clean_model_visible_text(text: &str) -> String {
         value = stripped.trim_end();
     }
     value.to_string()
+}
+
+fn strip_visible_tool_protocol_blocks(text: &str) -> String {
+    let mut value = text.to_string();
+    for open in [
+        "<previous_tool_call",
+        "<tool_call",
+        "<tool_invoke",
+        "<aeon_tool_call",
+    ] {
+        value = strip_tag_blocks(&value, open);
+    }
+    value
+}
+
+fn strip_tag_blocks(text: &str, open: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find(open) else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let block = &rest[start..];
+        let close_candidates = if open.contains("previous_tool_call") {
+            &["</previous_tool_call>", "</tool_call>"][..]
+        } else if open.contains("aeon_tool_call") {
+            &["</aeon_tool_call>", "</aeon_tool_calls>"][..]
+        } else if open.contains("tool_invoke") {
+            &["</tool_invoke>"][..]
+        } else {
+            &["</tool_call>"][..]
+        };
+        let close = close_candidates
+            .iter()
+            .filter_map(|tag| block.find(tag).map(|index| (index, tag.len())))
+            .min_by_key(|(index, _)| *index);
+        if let Some((close_start, close_len)) = close {
+            rest = &block[close_start + close_len..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 fn fallback_tool_call_if_needed(
@@ -3073,6 +3119,16 @@ name = "MyOpenAI"
         assert_eq!(
             clean_model_visible_text("正在检查项目。\nFINISHEDFINISHED"),
             "正在检查项目。"
+        );
+    }
+
+    #[test]
+    fn strips_visible_tool_protocol_blocks_from_message_text() {
+        assert_eq!(
+            clean_model_visible_text(
+                "准备执行\n<previous_tool_call id=\"cleanup_unused\" name=\"shell_command\">{\"command\":\"pwd\"}</tool_call>\nFINISHED",
+            ),
+            "准备执行"
         );
     }
 

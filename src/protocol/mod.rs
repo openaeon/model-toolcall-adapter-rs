@@ -131,6 +131,9 @@ fn best_close_tag(open_tag: &str, after_open: &str, fallback: &'static str) -> &
     if open_tag.contains("tool_invoke") {
         return "</tool_invoke>";
     }
+    if open_tag.contains("previous_tool_call") && after_open.contains("</tool_call>") {
+        return "</tool_call>";
+    }
     fallback
 }
 
@@ -387,5 +390,17 @@ mod tests {
         assert_eq!(calls[0].id, "call_a");
         assert_eq!(calls[0].name, "exec_command");
         assert_eq!(calls[0].arguments, r#"{"cmd":"cargo check"}"#);
+    }
+
+    #[test]
+    fn parses_previous_tool_call_with_mismatched_close_tag() {
+        let calls = parse_tool_calls(
+            r#"<previous_tool_call id="call_a" name="shell_command">{"command":"pwd"}</tool_call>"#,
+        );
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "shell_command");
+        assert_eq!(calls[0].arguments, r#"{"command":"pwd"}"#);
     }
 }

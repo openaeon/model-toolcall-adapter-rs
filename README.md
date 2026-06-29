@@ -96,6 +96,8 @@ cd .\model-toolcall-adapter-rs-windows-x64-exe\model-toolcall-adapter-rs-windows
 .\model-toolcall-adapter-rs.exe
 ```
 
+Windows shells do not search the current directory automatically, so keep the `.\` prefix. The common DeepSeek Web `sha256` PoW challenge is solved inside the Rust adapter, so Windows users do not need to install Node.js for that path.
+
 macOS Apple Silicon:
 
 ```bash

@@ -10,7 +10,7 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::config::AppConfig;
+use crate::config::{response_store_path, AppConfig};
 use crate::responses_store::ResponseStore;
 use crate::upstream::OpenAiChatUpstream;
 
@@ -40,7 +40,7 @@ pub struct DeepSeekBrowserProcess {
 pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
     let bind: SocketAddr = config.bind.parse()?;
     let upstream = OpenAiChatUpstream::new(&config)?;
-    let responses = ResponseStore::default();
+    let responses = ResponseStore::load(response_store_path().ok());
     let state = Arc::new(AppState {
         config,
         upstream,

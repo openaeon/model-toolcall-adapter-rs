@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -8,10 +10,16 @@ use crate::types::{UnifiedContent, UnifiedMessage, UnifiedRequest};
 
 #[derive(Clone, Default)]
 pub struct ResponseStore {
-    inner: Arc<Mutex<HashMap<String, StoredResponse>>>,
+    inner: Arc<Mutex<StoreInner>>,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
+struct StoreInner {
+    entries: HashMap<String, StoredResponse>,
+    path: Option<PathBuf>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredResponse {
     body: Value,
     input_items: Vec<Value>,
@@ -27,6 +35,42 @@ pub enum StoreError {
 }
 
 impl ResponseStore {
+    pub fn load(path: Option<PathBuf>) -> Self {
+        let entries = path
+            .as_ref()
+            .and_then(|path| match std::fs::read_to_string(path) {
+                Ok(raw) => match serde_json::from_str::<HashMap<String, StoredResponse>>(&raw) {
+                    Ok(entries) => Some(entries),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "failed to parse persisted response store"
+                        );
+                        None
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(HashMap::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "failed to read persisted response store"
+                    );
+                    None
+                }
+            })
+            .unwrap_or_default();
+        tracing::info!(
+            response_count = entries.len(),
+            path = path.as_ref().map(|path| path.display().to_string()),
+            "loaded response store"
+        );
+        Self {
+            inner: Arc::new(Mutex::new(StoreInner { entries, path })),
+        }
+    }
+
     pub fn insert_with_provider_session(
         &self,
         body: Value,
@@ -48,7 +92,7 @@ impl ResponseStore {
             .cloned()
             .unwrap_or_default();
         let mut guard = self.inner.lock().expect("response store mutex poisoned");
-        guard.insert(
+        guard.entries.insert(
             id,
             StoredResponse {
                 body,
@@ -58,12 +102,14 @@ impl ResponseStore {
                 provider_session_id,
             },
         );
+        persist_locked(&guard);
     }
 
     pub fn provider_session_id_for(&self, response_id: &str) -> Option<String> {
         self.inner
             .lock()
             .expect("response store mutex poisoned")
+            .entries
             .get(response_id)
             .and_then(|entry| entry.provider_session_id.clone())
     }
@@ -72,6 +118,7 @@ impl ResponseStore {
         self.inner
             .lock()
             .expect("response store mutex poisoned")
+            .entries
             .get(response_id)
             .map(|entry| entry.body.clone())
     }
@@ -80,6 +127,7 @@ impl ResponseStore {
         self.inner
             .lock()
             .expect("response store mutex poisoned")
+            .entries
             .get(response_id)
             .map(|entry| entry.output_items.clone())
     }
@@ -95,6 +143,7 @@ impl ResponseStore {
             .inner
             .lock()
             .expect("response store mutex poisoned")
+            .entries
             .get(response_id)?
             .clone();
         let mut items = entry.input_items;
@@ -136,14 +185,51 @@ impl ResponseStore {
 
     pub fn cancel(&self, response_id: &str) -> Result<Value, StoreError> {
         let mut guard = self.inner.lock().expect("response store mutex poisoned");
-        let entry = guard.get_mut(response_id).ok_or(StoreError::NotFound)?;
-        if !entry.background {
-            return Err(StoreError::NotBackground);
+        let body = {
+            let entry = guard
+                .entries
+                .get_mut(response_id)
+                .ok_or(StoreError::NotFound)?;
+            if !entry.background {
+                return Err(StoreError::NotBackground);
+            }
+            if let Some(status) = entry.body.get_mut("status") {
+                *status = Value::String("cancelled".to_string());
+            }
+            entry.body.clone()
+        };
+        persist_locked(&guard);
+        Ok(body)
+    }
+}
+
+fn persist_locked(store: &StoreInner) {
+    let Some(path) = store.path.as_ref() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                path = %parent.display(),
+                error = %error,
+                "failed to create response store directory"
+            );
+            return;
         }
-        if let Some(status) = entry.body.get_mut("status") {
-            *status = Value::String("cancelled".to_string());
+    }
+    let raw = match serde_json::to_string_pretty(&store.entries) {
+        Ok(raw) => raw,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to serialize response store");
+            return;
         }
-        Ok(entry.body.clone())
+    };
+    if let Err(error) = std::fs::write(path, raw) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "failed to persist response store"
+        );
     }
 }
 
@@ -332,6 +418,52 @@ mod tests {
             store.provider_session_id_for("resp_1").as_deref(),
             Some("deepseek-session-a")
         );
+    }
+
+    #[test]
+    fn persists_and_reloads_response_context() {
+        let path = std::env::temp_dir().join(format!(
+            "model-toolcall-adapter-responses-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ResponseStore::load(Some(path.clone()));
+        store.insert_with_provider_session(
+            json!({
+                "id": "resp_1",
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "id": "fc_1",
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "search",
+                    "arguments": "{\"q\":\"rs\"}"
+                }]
+            }),
+            vec![json!({
+                "id": "msg_current",
+                "type": "message",
+                "role": "user",
+                "content": [{"type":"input_text","text":"current"}]
+            })],
+            vec![],
+            true,
+            Some("provider-state-a".to_string()),
+        );
+
+        let loaded = ResponseStore::load(Some(path.clone()));
+
+        assert!(loaded.retrieve("resp_1").is_some());
+        assert_eq!(
+            loaded.provider_session_id_for("resp_1").as_deref(),
+            Some("provider-state-a")
+        );
+        assert_eq!(
+            loaded.context_items_for("resp_1").unwrap()[0]["call_id"],
+            "call_a"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

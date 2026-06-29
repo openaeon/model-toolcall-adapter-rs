@@ -165,11 +165,20 @@ pub fn local_config_path() -> Result<PathBuf, std::io::Error> {
     if let Some(path) = std::env::var_os("ADAPTER_CONFIG_FILE") {
         return Ok(PathBuf::from(path));
     }
+    Ok(adapter_data_dir()?.join("config.json"))
+}
+
+pub fn response_store_path() -> Result<PathBuf, std::io::Error> {
+    if let Some(path) = std::env::var_os("ADAPTER_RESPONSE_STORE_FILE") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(adapter_data_dir()?.join("responses_store.json"))
+}
+
+pub fn adapter_data_dir() -> Result<PathBuf, std::io::Error> {
     let home = std::env::var_os("HOME")
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
-    Ok(PathBuf::from(home)
-        .join(".model-toolcall-adapter")
-        .join("config.json"))
+    Ok(PathBuf::from(home).join(".model-toolcall-adapter"))
 }
 
 pub fn update_local_config(

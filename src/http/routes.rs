@@ -1852,7 +1852,7 @@ async fn emit_function_call_argument_events(sink: &mut SseSink, output_index: us
         item_id,
         call_id,
         argument_chars = arguments.chars().count(),
-        arguments_preview = %truncate_for_log(arguments, 240),
+        arguments_preview = %redact_sensitive_log_value(&truncate_for_log(arguments, 240)),
         "responses sse function arguments emit"
     );
     sink.send_event(
@@ -2001,6 +2001,16 @@ async fn emit_reasoning_delta(sink: &mut SseSink, output_index: usize, delta: &s
         }),
     )
     .await;
+    sink.send_event(
+        "response.reasoning_text.delta",
+        json!({
+            "type": "response.reasoning_text.delta",
+            "output_index": output_index,
+            "content_index": 0,
+            "delta": delta
+        }),
+    )
+    .await;
 }
 
 async fn emit_reasoning_done(sink: &mut SseSink, output_index: usize, reasoning: &str) {
@@ -2068,6 +2078,16 @@ async fn emit_reasoning_item(sink: &mut SseSink, output_index: usize, item: &Val
             "type": "response.reasoning_summary_text.delta",
             "output_index": output_index,
             "summary_index": 0,
+            "delta": reasoning
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.reasoning_text.delta",
+        json!({
+            "type": "response.reasoning_text.delta",
+            "output_index": output_index,
+            "content_index": 0,
             "delta": reasoning
         }),
     )
@@ -2173,6 +2193,7 @@ fn log_codex_request_summary(
         .iter()
         .map(|message| message.content_text().chars().count())
         .sum();
+    let tool_result_ids = request_tool_result_ids(request);
     tracing::info!(
         mode = ?mode,
         model = %request.model,
@@ -2185,6 +2206,8 @@ fn log_codex_request_summary(
         parallel_tool_calls = request.parallel_tool_calls,
         input_messages = request.messages.len(),
         input_chars,
+        tool_result_count = tool_result_ids.len(),
+        tool_result_ids = ?tool_result_ids,
         upstream_options = ?upstream_options.redacted(),
         "codex request summary"
     );
@@ -2214,7 +2237,10 @@ fn log_response_summary(stage: &str, body: &Value) {
                 .get("arguments")
                 .and_then(|value| value.as_str())
                 .unwrap_or_default();
-            Some(format!("{name}:{}", truncate_for_log(arguments, 180)))
+            Some(format!(
+                "{name}:{}",
+                redact_sensitive_log_value(&truncate_for_log(arguments, 180))
+            ))
         })
         .collect::<Vec<_>>();
     let reasoning_chars: usize = output
@@ -2250,6 +2276,7 @@ fn log_response_summary(stage: &str, body: &Value) {
         status,
         model,
         output_count = output.len(),
+        next_action = response_next_action(&output),
         output_types = ?output_types,
         tool_names = ?tool_names,
         tool_args = ?tool_args,
@@ -2261,13 +2288,49 @@ fn log_response_summary(stage: &str, body: &Value) {
     );
 }
 
+fn request_tool_result_ids(request: &UnifiedRequest) -> Vec<String> {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|content| match content {
+            crate::types::UnifiedContent::ToolResult { tool_use_id, .. } => {
+                Some(tool_use_id.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn response_next_action(output: &[Value]) -> &'static str {
+    if output
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+    {
+        "wait_for_tool_output"
+    } else if output
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+    {
+        "final_or_commentary"
+    } else {
+        "no_output"
+    }
+}
+
 fn log_tool_call_candidates(response_id: Option<&str>, tool_calls: &[ParsedToolCall]) {
     if tool_calls.is_empty() {
         return;
     }
     let calls = tool_calls
         .iter()
-        .map(|call| format!("{}:{}", call.name, truncate_for_log(&call.arguments, 220)))
+        .map(|call| {
+            format!(
+                "{}:{}",
+                call.name,
+                redact_sensitive_log_value(&truncate_for_log(&call.arguments, 220))
+            )
+        })
         .collect::<Vec<_>>();
     tracing::info!(
         response_id,
@@ -2680,6 +2743,58 @@ fn truncate_for_log(text: &str, max_chars: usize) -> String {
     }
     let mut out = trimmed.chars().take(max_chars).collect::<String>();
     out.push_str("...");
+    out
+}
+
+fn redact_sensitive_log_value(text: &str) -> String {
+    let mut value = text.to_string();
+    for key in [
+        "authorization",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "token",
+        "cookie",
+        "password",
+        "session",
+    ] {
+        value = redact_json_like_key(&value, key);
+    }
+    value
+}
+
+fn redact_json_like_key(text: &str, key: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let quoted_key = format!("\"{key}\"");
+    while let Some(index) = rest.to_ascii_lowercase().find(&quoted_key) {
+        out.push_str(&rest[..index]);
+        out.push_str(&rest[index..index + quoted_key.len()]);
+        let after_key = &rest[index + quoted_key.len()..];
+        let Some(colon_index) = after_key.find(':') else {
+            rest = after_key;
+            continue;
+        };
+        out.push_str(&after_key[..=colon_index]);
+        let after_colon = &after_key[colon_index + 1..];
+        let trim_len = after_colon.len() - after_colon.trim_start().len();
+        out.push_str(&after_colon[..trim_len]);
+        let value_start = &after_colon[trim_len..];
+        if let Some(stripped) = value_start.strip_prefix('"') {
+            out.push_str("\"[redacted]\"");
+            if let Some(end_index) = stripped.find('"') {
+                rest = &stripped[end_index + 1..];
+            } else {
+                rest = "";
+            }
+        } else {
+            out.push_str("\"[redacted]\"");
+            let end_index = value_start.find([',', '}']).unwrap_or(value_start.len());
+            rest = &value_start[end_index..];
+        }
+    }
+    out.push_str(rest);
     out
 }
 

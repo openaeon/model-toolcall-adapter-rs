@@ -5,6 +5,8 @@ use crate::types::{ParsedToolCall, ToolDefinition};
 const TOOL_TAGS: &[(&str, &str)] = &[
     ("<tool_call", "</tool_call>"),
     ("tool_call", "</tool_call>"),
+    ("<previous_tool_call", "</previous_tool_call>"),
+    ("previous_tool_call", "</previous_tool_call>"),
     ("<tool_invoke", "</tool_invoke>"),
     ("tool_invoke", "</tool_invoke>"),
     ("<aeon_tool_call", "</aeon_tool_call>"),
@@ -15,17 +17,25 @@ const TOOL_TAGS: &[(&str, &str)] = &[
 
 pub fn render_tool_protocol_prompt(tools: &[ToolDefinition]) -> String {
     let mut prompt = String::from(
-        "Adapter tool-call protocol override.\n\
-The surrounding system prompt may describe native tool calls, but this model cannot call native tools directly.\n\
-When a tool is needed, output exactly one XML tool call and no markdown, explanation, or extra text:\n\n\
+        "CRITICAL adapter tool-call protocol override.\n\
+You are behind an adapter. The client cannot see DeepSeek native actions or free-form tool descriptions.\n\
+When the user's request requires reading files, inspecting the current project, running commands, editing files, opening local resources, or using any external/runtime capability, you MUST output exactly one XML tool call and no markdown, explanation, greeting, or extra text.\n\
+Do not claim you are ready, do not ask what to work on, and do not answer from memory when a listed tool can inspect the real state.\n\
+For Chinese user messages, respond in Chinese. Preserve the user's language for tool arguments and final answers.\n\
+Tool call format:\n\n\
 <tool_call id=\"call_unique_id\" name=\"tool_name\">\n\
 {\"arg\":\"value\"}\n\
 </tool_call>\n\n\
 Rules:\n\
 - Use only tools listed below.\n\
 - The body must be valid JSON.\n\
-- Preserve the user's language when choosing arguments.\n\
-- If no tool is needed, answer normally.\n",
+- For project inspection requests, prefer command/file-reading tools such as exec_command when available.\n\
+- Treat tools as actions, never as prose. If you decide to use a tool, output only the XML tool call and stop.\n\
+- After a tool result, decide the next step from that result: call another tool when more real state is needed, otherwise give the final answer.\n\
+- For skill/plugin/MCP work, first read the referenced skill or instruction file with the available file/resource tool, then call the relevant MCP/plugin tool only with arguments matching its schema.\n\
+- For shell commands, use the exact schema of the listed command tool. Do not invent fields. Prefer small read-only commands before edits.\n\
+- For editing, use apply_patch when it is available; do not describe an edit as finished unless the tool call has been returned and the client executed it.\n\
+- If no tool is needed, answer normally in the user's language.\n",
     );
     if tools.is_empty() {
         prompt.push_str("\nNo tools are available.");
@@ -366,5 +376,16 @@ mod tests {
         let calls =
             parse_tool_calls(r#"<tool_call id="a" name="get" url="https://example.com" />"#);
         assert_eq!(calls[0].arguments, r#"{"url":"https://example.com"}"#);
+    }
+
+    #[test]
+    fn parses_previous_tool_call_as_tool_call_candidate() {
+        let calls = parse_tool_calls(
+            r#"<previous_tool_call id="call_a" name="exec_command">{"cmd":"cargo check"}</previous_tool_call>FINISHED"#,
+        );
+
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].name, "exec_command");
+        assert_eq!(calls[0].arguments, r#"{"cmd":"cargo check"}"#);
     }
 }

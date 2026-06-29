@@ -7,7 +7,9 @@ use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::error::AdapterError;
-use crate::providers::{self, openai_compat::OpenAiCompatClient};
+use crate::providers::{
+    self, deepseek_web::DeepSeekStreamEvent, openai_compat::OpenAiCompatClient,
+};
 use crate::types::UnifiedRequest;
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,21 @@ impl OpenAiChatUpstream {
         options: &UpstreamRequestOptions,
     ) -> Result<UpstreamResponse, AdapterError> {
         providers::complete(request, prompt, options, &self.openai_compat).await
+    }
+
+    pub async fn complete_stream(
+        &self,
+        request: &UnifiedRequest,
+        prompt: &str,
+        options: &UpstreamRequestOptions,
+    ) -> Result<tokio::sync::mpsc::Receiver<Result<DeepSeekStreamEvent, AdapterError>>, AdapterError>
+    {
+        match providers::resolve_provider(request, options) {
+            providers::ProviderKind::DeepSeekWeb => {
+                providers::deepseek_web::complete_stream(request, prompt, options).await
+            }
+            providers::ProviderKind::OpenAiCompat => Err(AdapterError::StreamUnsupported),
+        }
     }
 
     pub async fn list_models(

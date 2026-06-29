@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Child;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub config: AppConfig,
     pub upstream: OpenAiChatUpstream,
     pub responses: ResponseStore,
+    pub provider_conversations: Arc<Mutex<HashMap<String, String>>>,
+    pub active_provider_runs: Arc<Mutex<HashSet<String>>>,
     pub setup: Arc<Mutex<SetupState>>,
 }
 
@@ -42,6 +45,8 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         config,
         upstream,
         responses,
+        provider_conversations: Arc::new(Mutex::new(HashMap::new())),
+        active_provider_runs: Arc::new(Mutex::new(HashSet::new())),
         setup: Arc::new(Mutex::new(SetupState::default())),
     });
 
@@ -97,8 +102,16 @@ pub async fn serve(config: AppConfig) -> anyhow::Result<()> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
+    let listener = tokio::net::TcpListener::bind(bind).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            anyhow::anyhow!(
+                "address http://{bind} is already in use; stop the existing adapter process or run with ADAPTER_BIND=127.0.0.1:8899"
+            )
+        } else {
+            anyhow::Error::new(error)
+        }
+    })?;
     tracing::info!("model tool-call adapter listening on http://{bind}");
-    let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

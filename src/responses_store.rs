@@ -15,7 +15,6 @@ pub struct ResponseStore {
 struct StoredResponse {
     body: Value,
     input_items: Vec<Value>,
-    context_items: Vec<Value>,
     output_items: Vec<Value>,
     background: bool,
     provider_session_id: Option<String>,
@@ -32,7 +31,7 @@ impl ResponseStore {
         &self,
         body: Value,
         input_items: Vec<Value>,
-        context_items: Vec<Value>,
+        _context_items: Vec<Value>,
         background: bool,
         provider_session_id: Option<String>,
     ) {
@@ -54,7 +53,6 @@ impl ResponseStore {
             StoredResponse {
                 body,
                 input_items,
-                context_items,
                 output_items,
                 background,
                 provider_session_id,
@@ -83,19 +81,7 @@ impl ResponseStore {
             .lock()
             .expect("response store mutex poisoned")
             .get(response_id)
-            .map(|entry| {
-                let mut items = entry
-                    .context_items
-                    .iter()
-                    .filter(|item| {
-                        let role = item.get("role").and_then(Value::as_str);
-                        !matches!(role, Some("system" | "developer"))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                items.extend(entry.output_items.clone());
-                items
-            })
+            .map(|entry| entry.output_items.clone())
     }
 
     pub fn list_input_items(
@@ -340,9 +326,8 @@ mod tests {
         let context = store.context_items_for("resp_1").expect("context items");
 
         assert_eq!(listed["data"].as_array().unwrap().len(), 1);
-        assert_eq!(context.len(), 3);
-        assert_eq!(context[0]["id"], "msg_previous");
-        assert_eq!(context[2]["id"], "msg_out");
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["id"], "msg_out");
         assert_eq!(
             store.provider_session_id_for("resp_1").as_deref(),
             Some("deepseek-session-a")

@@ -1,3 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
@@ -22,7 +25,7 @@ use crate::http::{AppState, DeepSeekBrowserProcess};
 use crate::protocol::{parse_tool_calls, render_tool_protocol_prompt};
 use crate::providers::deepseek_web::default_session_path as default_deepseek_session_path;
 use crate::responses_store;
-use crate::types::UnifiedRequest;
+use crate::types::{ParsedToolCall, UnifiedRequest};
 use crate::ui::INDEX_HTML;
 use crate::upstream::UpstreamRequestOptions;
 use crate::wire::{chat, messages, responses, WireMode};
@@ -1086,8 +1089,16 @@ async fn handle_value(
     mode: WireMode,
     upstream_options: &mut UpstreamRequestOptions,
 ) -> Result<Value, AdapterError> {
+    let conversation_key = matches!(mode, WireMode::Responses)
+        .then(|| adapter_conversation_key(&payload))
+        .flatten();
     let mut request = UnifiedRequest::from_wire_payload(mode, payload)?;
-    log_codex_request_summary(mode, &request, upstream_options);
+    log_codex_request_summary(
+        mode,
+        &request,
+        upstream_options,
+        conversation_key.as_deref(),
+    );
     if request.stream {
         return Err(AdapterError::StreamUnsupported);
     }
@@ -1095,7 +1106,12 @@ async fn handle_value(
         .then(|| responses_store::input_items_from_request(&request));
     if matches!(mode, WireMode::Responses) {
         prepend_previous_response_context(&state, &mut request)?;
-        attach_previous_provider_session(&state, &request, upstream_options);
+        attach_previous_provider_session(
+            &state,
+            &request,
+            conversation_key.as_deref(),
+            upstream_options,
+        );
     }
     if request.model.trim().is_empty() || request.model.trim() == "local-model" {
         request.model = state.config.upstream_model.clone();
@@ -1113,7 +1129,25 @@ async fn handle_value(
     tracing::info!("Mapped request model to={:?}", request.model);
     request.tools.truncate(state.config.max_tool_definitions);
 
+    if matches!(mode, WireMode::Responses) {
+        if let Some(body) = immediate_tool_response_if_needed(&request) {
+            let mut body = body;
+            restore_external_model(&mut body, &external_model);
+            log_response_summary("immediate_tool", &body);
+            let context_items = responses_store::input_items_from_request(&request);
+            state.responses.insert_with_provider_session(
+                strip_adapter_private_fields(&body),
+                response_input_items.unwrap_or_else(|| context_items.clone()),
+                context_items,
+                request.background,
+                None,
+            );
+            return Ok(strip_adapter_private_fields(&body));
+        }
+    }
+
     let protocol = render_tool_protocol_prompt(&request.tools);
+    let _run_guard = acquire_provider_run_guard(&state, conversation_key.as_deref())?;
     let body = match mode {
         WireMode::Responses => {
             let prompt = request.render_prompt_with_tool_protocol(&protocol);
@@ -1127,12 +1161,19 @@ async fn handle_value(
                     "upstream reasoning"
                 );
             }
-            let model_text = upstream_response.text;
-            let tool_calls = apply_tool_choice_to_tool_calls(
+            let model_text = clean_model_visible_text(&upstream_response.text);
+            let tool_parse_text =
+                combined_tool_parse_text(upstream_response.reasoning.as_deref(), &model_text);
+            let tool_calls = fallback_tool_call_if_needed(
                 &request,
                 &model_text,
-                parse_tool_calls(&model_text),
+                apply_tool_choice_to_tool_calls(
+                    &request,
+                    &model_text,
+                    parse_tool_calls(&tool_parse_text),
+                )?,
             )?;
+            log_tool_call_candidates(None, &tool_calls);
             let output_text = if tool_calls.is_empty() {
                 model_text.as_str()
             } else {
@@ -1156,6 +1197,7 @@ async fn handle_value(
                 body["_adapter_provider_session_id"] = Value::String(session_id.to_string());
             }
             restore_external_model(&mut body, &external_model);
+            log_response_summary("nonstream_responses", &body);
             body
         }
         WireMode::ChatCompletions | WireMode::Messages => {
@@ -1170,32 +1212,43 @@ async fn handle_value(
                     "upstream reasoning"
                 );
             }
-            let model_text = upstream_response.text;
-            let tool_calls = apply_tool_choice_to_tool_calls(
+            let model_text = clean_model_visible_text(&upstream_response.text);
+            let tool_parse_text =
+                combined_tool_parse_text(upstream_response.reasoning.as_deref(), &model_text);
+            let tool_calls = fallback_tool_call_if_needed(
                 &request,
                 &model_text,
-                parse_tool_calls(&model_text),
+                apply_tool_choice_to_tool_calls(
+                    &request,
+                    &model_text,
+                    parse_tool_calls(&tool_parse_text),
+                )?,
             )?;
+            log_tool_call_candidates(None, &tool_calls);
             let mut body = match mode {
                 WireMode::ChatCompletions => chat::response(&request, &model_text, &tool_calls),
                 WireMode::Messages => messages::response(&request, &model_text, &tool_calls),
                 WireMode::Responses => unreachable!(),
             };
             restore_external_model(&mut body, &external_model);
+            log_response_summary("nonstream_legacy", &body);
             body
         }
     };
     if matches!(mode, WireMode::Responses) {
+        let provider_state = body
+            .get("_adapter_provider_session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
         let context_items = responses_store::input_items_from_request(&request);
         state.responses.insert_with_provider_session(
             strip_adapter_private_fields(&body),
             response_input_items.unwrap_or_else(|| context_items.clone()),
             context_items,
             request.background,
-            body.get("_adapter_provider_session_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+            provider_state.clone(),
         );
+        remember_provider_conversation_state(&state, conversation_key.as_deref(), provider_state);
     }
     Ok(strip_adapter_private_fields(&body))
 }
@@ -1206,11 +1259,22 @@ fn responses_streaming_sse(
     mut upstream_options: UpstreamRequestOptions,
 ) -> Result<Response, AdapterError> {
     payload["stream"] = Value::Bool(false);
+    let conversation_key = adapter_conversation_key(&payload);
     let mut request = UnifiedRequest::from_wire_payload(WireMode::Responses, payload)?;
-    log_codex_request_summary(WireMode::Responses, &request, &upstream_options);
+    log_codex_request_summary(
+        WireMode::Responses,
+        &request,
+        &upstream_options,
+        conversation_key.as_deref(),
+    );
     let response_input_items = responses_store::input_items_from_request(&request);
     prepend_previous_response_context(&state, &mut request)?;
-    attach_previous_provider_session(&state, &request, &mut upstream_options);
+    attach_previous_provider_session(
+        &state,
+        &request,
+        conversation_key.as_deref(),
+        &mut upstream_options,
+    );
     if request.model.trim().is_empty() || request.model.trim() == "local-model" {
         request.model = state.config.upstream_model.clone();
     }
@@ -1247,9 +1311,62 @@ fn responses_streaming_sse(
         )
         .await;
 
+        if let Some(mut completed) = immediate_tool_response_if_needed(&request) {
+            completed["id"] = shell_response["id"].clone();
+            completed["created_at"] = shell_response["created_at"].clone();
+            restore_external_model(&mut completed, &external_model);
+            let public_completed = strip_adapter_private_fields(&completed);
+            log_response_summary("stream_immediate_tool", &public_completed);
+            for (index, item) in public_completed
+                .get("output")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                emit_output_item(&mut sink, index, item).await;
+            }
+            sink.send_event(
+                "response.completed",
+                json!({ "type": "response.completed", "response": public_completed }),
+            )
+            .await;
+            sink.send_done().await;
+            let context_items = responses_store::input_items_from_request(&request);
+            stream_state.responses.insert_with_provider_session(
+                public_completed,
+                response_input_items,
+                context_items,
+                request.background,
+                None,
+            );
+            return;
+        }
+
         let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(2));
         let protocol = render_tool_protocol_prompt(&request.tools);
         let prompt = request.render_prompt_with_tool_protocol(&protocol);
+        match try_stream_deepseek_response(
+            &stream_state,
+            &request,
+            &prompt,
+            &upstream_options,
+            &external_model,
+            &mut sink,
+            shell_response.clone(),
+            response_input_items.clone(),
+            conversation_key.clone(),
+        )
+        .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                emit_response_error(&mut sink, shell_response, error.to_string()).await;
+                return;
+            }
+        }
+
         let upstream = stream_state
             .upstream
             .complete(&request, &prompt, &upstream_options);
@@ -1272,15 +1389,26 @@ fn responses_streaming_sse(
 
         match result {
             Ok(upstream_response) => {
-                if let Some(reasoning) = upstream_response.reasoning.as_deref() {
-                    emit_reasoning_item(&mut sink, 0, reasoning).await;
+                let reasoning_item = upstream_response
+                    .reasoning
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(responses::reasoning_output_item);
+                if let Some(item) = reasoning_item.as_ref() {
+                    emit_reasoning_item(&mut sink, 0, item).await;
                 }
-                let model_text = upstream_response.text;
+                let model_text = clean_model_visible_text(&upstream_response.text);
+                let tool_parse_text =
+                    combined_tool_parse_text(upstream_response.reasoning.as_deref(), &model_text);
                 let parsed_tool_calls = match apply_tool_choice_to_tool_calls(
                     &request,
                     &model_text,
-                    parse_tool_calls(&model_text),
-                ) {
+                    parse_tool_calls(&tool_parse_text),
+                )
+                .and_then(|tool_calls| {
+                    fallback_tool_call_if_needed(&request, &model_text, tool_calls)
+                }) {
                     Ok(tool_calls) => constrain_parallel_tool_calls(&request, tool_calls),
                     Err(error) => {
                         emit_response_error(&mut sink, shell_response, error.to_string()).await;
@@ -1306,13 +1434,13 @@ fn responses_streaming_sse(
                 } else {
                     (responses::function_call_items(&parsed_tool_calls), "")
                 };
-                let output =
-                    prepend_reasoning_output(upstream_response.reasoning.as_deref(), output);
+                let output = prepend_reasoning_item(reasoning_item, output);
                 let mut completed = responses::response_from_output(&request, output, output_text);
                 completed["id"] = shell_response["id"].clone();
                 completed["created_at"] = shell_response["created_at"].clone();
                 restore_external_model(&mut completed, &external_model);
                 let public_completed = strip_adapter_private_fields(&completed);
+                log_response_summary("stream_fallback_complete", &public_completed);
 
                 for (index, item) in public_completed
                     .get("output")
@@ -1338,6 +1466,11 @@ fn responses_streaming_sse(
                     response_input_items,
                     context_items,
                     request.background,
+                    provider_session_id.clone(),
+                );
+                remember_provider_conversation_state(
+                    &stream_state,
+                    conversation_key.as_deref(),
                     provider_session_id,
                 );
             }
@@ -1361,6 +1494,210 @@ fn body_without_output(body: &Value) -> Value {
     let mut value = body.clone();
     value["output"] = json!([]);
     value
+}
+
+async fn try_stream_deepseek_response(
+    state: &AppState,
+    request: &UnifiedRequest,
+    prompt: &str,
+    upstream_options: &UpstreamRequestOptions,
+    external_model: &str,
+    sink: &mut SseSink,
+    shell_response: Value,
+    response_input_items: Vec<Value>,
+    conversation_key: Option<String>,
+) -> Result<bool, AdapterError> {
+    let _run_guard = acquire_provider_run_guard(state, conversation_key.as_deref())?;
+    let mut upstream = match state
+        .upstream
+        .complete_stream(request, prompt, upstream_options)
+        .await
+    {
+        Ok(upstream) => upstream,
+        Err(AdapterError::StreamUnsupported) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut provider_session_id = None;
+    let mut text_started = false;
+    let mut reasoning_started = false;
+    let buffer_text_until_tool_decision = should_buffer_text_until_tool_decision(request);
+    let mut reasoning_delta_count = 0usize;
+    let mut text_delta_count = 0usize;
+    let response_id = shell_response
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    tracing::info!(
+        response_id = response_id.as_deref(),
+        model = %request.model,
+        tools_available = !request.tools.is_empty(),
+        buffer_text_until_tool_decision,
+        previous_response_id = request.previous_response_id.as_deref(),
+        "deepseek streaming started"
+    );
+
+    loop {
+        tokio::select! {
+            _ = keepalive.tick() => {
+                sink.send_event(
+                    "response.in_progress",
+                    json!({
+                        "type": "response.in_progress",
+                        "response": body_without_output(&shell_response)
+                    }),
+                ).await;
+            }
+            event = upstream.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                match event? {
+                    crate::providers::deepseek_web::DeepSeekStreamEvent::ReasoningDelta(delta) => {
+                        if !reasoning_started {
+                            emit_reasoning_started(sink, 0).await;
+                            reasoning_started = true;
+                        }
+                        reasoning.push_str(&delta);
+                        reasoning_delta_count += 1;
+                        emit_reasoning_delta(sink, 0, &delta).await;
+                    }
+                    crate::providers::deepseek_web::DeepSeekStreamEvent::TextDelta(delta) => {
+                        text.push_str(&delta);
+                        text_delta_count += 1;
+                        if !buffer_text_until_tool_decision {
+                            if !text_started {
+                                emit_message_started(sink, 1).await;
+                                text_started = true;
+                            }
+                            emit_text_delta(sink, 1, 0, &delta).await;
+                        }
+                    }
+                    crate::providers::deepseek_web::DeepSeekStreamEvent::SessionId(session_id) => {
+                        provider_session_id = Some(session_id);
+                    }
+                    crate::providers::deepseek_web::DeepSeekStreamEvent::Done {
+                        text: done_text,
+                        reasoning: done_reasoning,
+                        session_id,
+                        parent_message_id,
+                    } => {
+                        if text.is_empty() {
+                            text = done_text;
+                        }
+                        if reasoning.is_empty() {
+                            reasoning = done_reasoning.unwrap_or_default();
+                        }
+                        provider_session_id =
+                            Some(deepseek_provider_state_json(&session_id, parent_message_id));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let reasoning_item =
+        (!reasoning.trim().is_empty()).then(|| responses::reasoning_output_item(reasoning.trim()));
+    if reasoning_started {
+        emit_reasoning_done(sink, 0, reasoning.trim()).await;
+    } else if let Some(item) = reasoning_item.as_ref() {
+        emit_reasoning_item(sink, 0, item).await;
+    }
+
+    let tool_parse_text = combined_tool_parse_text(
+        (!reasoning.trim().is_empty()).then_some(reasoning.as_str()),
+        &text,
+    );
+    let visible_text = clean_model_visible_text(&text);
+    let parsed_tool_calls =
+        apply_tool_choice_to_tool_calls(request, &visible_text, parse_tool_calls(&tool_parse_text))
+            .and_then(|tool_calls| {
+                fallback_tool_call_if_needed(request, &visible_text, tool_calls)
+            })?;
+    let parsed_tool_calls = constrain_parallel_tool_calls(request, parsed_tool_calls);
+    let parsed_tool_names = parsed_tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>();
+    log_tool_call_candidates(response_id.as_deref(), &parsed_tool_calls);
+    tracing::info!(
+        response_id = response_id.as_deref(),
+        reasoning_delta_count,
+        text_delta_count,
+        reasoning_chars = reasoning.chars().count(),
+        text_chars = visible_text.chars().count(),
+        parsed_tool_count = parsed_tool_calls.len(),
+        parsed_tool_names = ?parsed_tool_names,
+        buffer_text_until_tool_decision,
+        provider_state = provider_session_id.as_deref(),
+        "deepseek streaming finished"
+    );
+    if parsed_tool_calls.is_empty() && request.tool_choice.requires_tool() {
+        return Err(AdapterError::InvalidRequest(
+            "tool_choice requires a tool call, but the upstream model returned text".to_string(),
+        ));
+    }
+
+    let (mut output, output_text) = if parsed_tool_calls.is_empty() {
+        if buffer_text_until_tool_decision && !visible_text.trim().is_empty() {
+            emit_message_started(sink, 1).await;
+            text_started = true;
+            emit_text_delta(sink, 1, 0, &visible_text).await;
+        }
+        if text_started {
+            emit_text_done(sink, 1, 0, &visible_text).await;
+            emit_message_done(sink, 1, &visible_text).await;
+        }
+        (
+            vec![responses::message_output_item(&visible_text)],
+            visible_text.as_str(),
+        )
+    } else {
+        (responses::function_call_items(&parsed_tool_calls), "")
+    };
+    output = prepend_reasoning_item(reasoning_item, output);
+
+    let mut completed = responses::response_from_output(request, output, output_text);
+    completed["id"] = shell_response["id"].clone();
+    completed["created_at"] = shell_response["created_at"].clone();
+    restore_external_model(&mut completed, external_model);
+    let public_completed = strip_adapter_private_fields(&completed);
+    log_response_summary("stream_deepseek_complete", &public_completed);
+
+    if !parsed_tool_calls.is_empty() {
+        for (index, item) in public_completed
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                continue;
+            }
+            emit_output_item(sink, index, item).await;
+        }
+    }
+    sink.send_event(
+        "response.completed",
+        json!({ "type": "response.completed", "response": public_completed }),
+    )
+    .await;
+    sink.send_done().await;
+    let context_items = responses_store::input_items_from_request(request);
+    state.responses.insert_with_provider_session(
+        public_completed,
+        response_input_items,
+        context_items,
+        request.background,
+        provider_session_id.clone(),
+    );
+    remember_provider_conversation_state(state, conversation_key.as_deref(), provider_session_id);
+    Ok(true)
 }
 
 fn push_message_text_events(stream: &mut String, output_index: usize, item: &Value) {
@@ -1479,8 +1816,170 @@ async fn emit_output_item(sink: &mut SseSink, output_index: usize, item: &Value)
     .await;
 }
 
-async fn emit_reasoning_item(sink: &mut SseSink, output_index: usize, reasoning: &str) {
-    let item = responses::reasoning_output_item(reasoning);
+async fn emit_message_started(sink: &mut SseSink, output_index: usize) {
+    let item = json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4()),
+        "type": "message",
+        "status": "in_progress",
+        "role": "assistant",
+        "content": []
+    });
+    sink.send_event(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item,
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.content_part.added",
+        json!({
+            "type": "response.content_part.added",
+            "output_index": output_index,
+            "content_index": 0,
+            "part": { "type": "output_text", "text": "", "annotations": [] },
+        }),
+    )
+    .await;
+}
+
+async fn emit_text_delta(
+    sink: &mut SseSink,
+    output_index: usize,
+    content_index: usize,
+    delta: &str,
+) {
+    sink.send_event(
+        "response.output_text.delta",
+        json!({
+            "type": "response.output_text.delta",
+            "output_index": output_index,
+            "content_index": content_index,
+            "delta": delta,
+        }),
+    )
+    .await;
+}
+
+async fn emit_text_done(sink: &mut SseSink, output_index: usize, content_index: usize, text: &str) {
+    sink.send_event(
+        "response.output_text.done",
+        json!({
+            "type": "response.output_text.done",
+            "output_index": output_index,
+            "content_index": content_index,
+            "text": text,
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.content_part.done",
+        json!({
+            "type": "response.content_part.done",
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": { "type": "output_text", "text": text, "annotations": [] },
+        }),
+    )
+    .await;
+}
+
+async fn emit_message_done(sink: &mut SseSink, output_index: usize, text: &str) {
+    let item = responses::message_output_item(text);
+    sink.send_event(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": item,
+        }),
+    )
+    .await;
+}
+
+async fn emit_reasoning_started(sink: &mut SseSink, output_index: usize) {
+    let item = json!({
+        "id": format!("rs_{}", uuid::Uuid::new_v4()),
+        "type": "reasoning",
+        "status": "in_progress",
+        "summary": []
+    });
+    sink.send_event(
+        "response.output_item.added",
+        json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": item,
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.reasoning_summary_part.added",
+        json!({
+            "type": "response.reasoning_summary_part.added",
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": "" }
+        }),
+    )
+    .await;
+}
+
+async fn emit_reasoning_delta(sink: &mut SseSink, output_index: usize, delta: &str) {
+    sink.send_event(
+        "response.reasoning_summary_text.delta",
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": output_index,
+            "summary_index": 0,
+            "delta": delta
+        }),
+    )
+    .await;
+}
+
+async fn emit_reasoning_done(sink: &mut SseSink, output_index: usize, reasoning: &str) {
+    sink.send_event(
+        "response.reasoning_summary_text.done",
+        json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": output_index,
+            "summary_index": 0,
+            "text": reasoning
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.reasoning_summary_part.done",
+        json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": output_index,
+            "summary_index": 0,
+            "part": { "type": "summary_text", "text": reasoning }
+        }),
+    )
+    .await;
+    sink.send_event(
+        "response.output_item.done",
+        json!({
+            "type": "response.output_item.done",
+            "output_index": output_index,
+            "item": responses::reasoning_output_item(reasoning),
+        }),
+    )
+    .await;
+}
+
+async fn emit_reasoning_item(sink: &mut SseSink, output_index: usize, item: &Value) {
+    let reasoning = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .and_then(|summary| summary.first())
+        .and_then(|part| part.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     sink.send_event(
         "response.output_item.added",
         json!({
@@ -1549,6 +2048,14 @@ fn prepend_reasoning_output(reasoning: Option<&str>, mut output: Vec<Value>) -> 
     output
 }
 
+fn prepend_reasoning_item(reasoning_item: Option<Value>, mut output: Vec<Value>) -> Vec<Value> {
+    let Some(reasoning_item) = reasoning_item else {
+        return output;
+    };
+    output.insert(0, reasoning_item);
+    output
+}
+
 async fn emit_response_error(sink: &mut SseSink, mut response: Value, message: impl Into<String>) {
     response["status"] = Value::String("failed".to_string());
     response["error"] = json!({
@@ -1590,6 +2097,7 @@ fn log_codex_request_summary(
     mode: WireMode,
     request: &UnifiedRequest,
     upstream_options: &UpstreamRequestOptions,
+    conversation_key: Option<&str>,
 ) {
     let tool_names = request
         .tools
@@ -1607,6 +2115,7 @@ fn log_codex_request_summary(
         model = %request.model,
         stream = request.stream,
         previous_response_id = request.previous_response_id.as_deref(),
+        conversation_key = conversation_key.map(|value| truncate_for_log(value, 96)),
         tool_count = request.tools.len(),
         tool_names = ?tool_names,
         tool_choice = ?request.tool_choice.to_wire_value(),
@@ -1618,28 +2127,264 @@ fn log_codex_request_summary(
     );
 }
 
+fn log_response_summary(stage: &str, body: &Value) {
+    let output = body
+        .get("output")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let output_types = output
+        .iter()
+        .filter_map(|item| item.get("type").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    let tool_names = output
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call"))
+        .filter_map(|item| item.get("name").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    let tool_args = output
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("function_call"))
+        .filter_map(|item| {
+            let name = item.get("name").and_then(|value| value.as_str())?;
+            let arguments = item
+                .get("arguments")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            Some(format!("{name}:{}", truncate_for_log(arguments, 180)))
+        })
+        .collect::<Vec<_>>();
+    let reasoning_chars: usize = output
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("reasoning"))
+        .filter_map(|item| item.get("summary").and_then(|value| value.as_array()))
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+        .map(|text| text.chars().count())
+        .sum();
+    let message_chars: usize = output
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(|value| value.as_array()))
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+        .map(|text| text.chars().count())
+        .sum();
+    let response_id = body.get("id").and_then(|value| value.as_str());
+    let status = body.get("status").and_then(|value| value.as_str());
+    let model = body.get("model").and_then(|value| value.as_str());
+    let output_text_chars = body
+        .get("output_text")
+        .and_then(|value| value.as_str())
+        .map(|text| text.chars().count())
+        .unwrap_or_default();
+    let previous_response_id = body
+        .get("previous_response_id")
+        .and_then(|value| value.as_str());
+    tracing::info!(
+        stage,
+        response_id,
+        status,
+        model,
+        output_count = output.len(),
+        output_types = ?output_types,
+        tool_names = ?tool_names,
+        tool_args = ?tool_args,
+        output_text_chars,
+        message_chars,
+        reasoning_chars,
+        previous_response_id,
+        "adapter response summary"
+    );
+}
+
+fn log_tool_call_candidates(response_id: Option<&str>, tool_calls: &[ParsedToolCall]) {
+    if tool_calls.is_empty() {
+        return;
+    }
+    let calls = tool_calls
+        .iter()
+        .map(|call| format!("{}:{}", call.name, truncate_for_log(&call.arguments, 220)))
+        .collect::<Vec<_>>();
+    tracing::info!(
+        response_id,
+        tool_call_count = tool_calls.len(),
+        tool_calls = ?calls,
+        "parsed adapter tool calls"
+    );
+}
+
 fn attach_previous_provider_session(
     state: &AppState,
     request: &UnifiedRequest,
+    conversation_key: Option<&str>,
     upstream_options: &mut UpstreamRequestOptions,
 ) {
     if upstream_options.provider_session_id.is_some() {
         return;
     }
-    let Some(previous_response_id) = request.previous_response_id.as_deref() else {
+    if let Some(previous_response_id) = request.previous_response_id.as_deref() {
+        if let Some(provider_state) = state
+            .responses
+            .provider_session_id_for(previous_response_id)
+        {
+            tracing::info!(
+                previous_response_id,
+                provider_state = %provider_state,
+                "reusing provider session from previous response"
+            );
+            upstream_options.provider_session_id = Some(provider_state);
+            return;
+        }
+    }
+    let Some(conversation_key) = conversation_key else {
         return;
     };
-    if let Some(session_id) = state
-        .responses
-        .provider_session_id_for(previous_response_id)
+    if let Some(provider_state) = state
+        .provider_conversations
+        .lock()
+        .expect("provider conversation map poisoned")
+        .get(conversation_key)
+        .cloned()
     {
         tracing::info!(
-            previous_response_id,
-            provider_session_id = %session_id,
-            "reusing provider session from previous response"
+            conversation_key = %truncate_for_log(conversation_key, 96),
+            provider_state = %provider_state,
+            "reusing provider session from adapter conversation state"
         );
-        upstream_options.provider_session_id = Some(session_id);
+        upstream_options.provider_session_id = Some(provider_state);
     }
+}
+
+fn remember_provider_conversation_state(
+    state: &AppState,
+    conversation_key: Option<&str>,
+    provider_state: Option<String>,
+) {
+    let (Some(conversation_key), Some(provider_state)) = (conversation_key, provider_state) else {
+        return;
+    };
+    state
+        .provider_conversations
+        .lock()
+        .expect("provider conversation map poisoned")
+        .insert(conversation_key.to_string(), provider_state.clone());
+    tracing::info!(
+        conversation_key = %truncate_for_log(conversation_key, 96),
+        provider_state = %provider_state,
+        "remembered provider session for adapter conversation"
+    );
+}
+
+struct ProviderRunGuard<'a> {
+    state: &'a AppState,
+    key: Option<String>,
+}
+
+impl Drop for ProviderRunGuard<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.as_deref() else {
+            return;
+        };
+        self.state
+            .active_provider_runs
+            .lock()
+            .expect("active provider run map poisoned")
+            .remove(key);
+    }
+}
+
+fn acquire_provider_run_guard<'a>(
+    state: &'a AppState,
+    conversation_key: Option<&str>,
+) -> Result<ProviderRunGuard<'a>, AdapterError> {
+    let Some(conversation_key) = conversation_key else {
+        return Ok(ProviderRunGuard { state, key: None });
+    };
+    let mut guard = state
+        .active_provider_runs
+        .lock()
+        .expect("active provider run map poisoned");
+    if !try_mark_provider_run_active(&mut guard, conversation_key) {
+        tracing::warn!(
+            conversation_key = %truncate_for_log(conversation_key, 96),
+            "duplicate in-flight provider run rejected"
+        );
+        return Err(AdapterError::InvalidRequest(
+            "another upstream response for this Codex conversation is still running; retry after it completes".to_string(),
+        ));
+    }
+    Ok(ProviderRunGuard {
+        state,
+        key: Some(conversation_key.to_string()),
+    })
+}
+
+fn try_mark_provider_run_active(active: &mut HashSet<String>, conversation_key: &str) -> bool {
+    active.insert(conversation_key.to_string())
+}
+
+fn adapter_conversation_key(payload: &Value) -> Option<String> {
+    if let Some(key) = payload
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("prompt_cache_key:{key}"));
+    }
+    if let Some(key) = payload
+        .pointer("/client_metadata/conversation_id")
+        .or_else(|| payload.pointer("/client_metadata/thread_id"))
+        .or_else(|| payload.pointer("/metadata/conversation_id"))
+        .or_else(|| payload.pointer("/metadata/thread_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!("metadata:{key}"));
+    }
+    let input = payload.get("input")?;
+    let Value::Array(items) = input else {
+        return None;
+    };
+    let first_user = items.iter().find_map(|item| {
+        (item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("user"))
+        .then(|| text_from_response_message_item(item))
+        .flatten()
+    })?;
+    stable_text_fingerprint(&first_user).map(|fingerprint| format!("first_user:{fingerprint}"))
+}
+
+fn text_from_response_message_item(item: &Value) -> Option<String> {
+    let content = item.get("content")?;
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("content"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        other => Some(other.to_string()),
+    }
+}
+
+fn stable_text_fingerprint(text: &str) -> Option<String> {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.trim().is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 fn strip_adapter_private_fields(value: &Value) -> Value {
@@ -1648,6 +2393,16 @@ fn strip_adapter_private_fields(value: &Value) -> Value {
         object.remove("_adapter_provider_session_id");
     }
     value
+}
+
+fn deepseek_provider_state_json(session_id: &str, parent_message_id: Option<Value>) -> String {
+    let mut state = json!({
+        "chat_session_id": session_id,
+    });
+    if let Some(parent_message_id) = parent_message_id {
+        state["parent_message_id"] = parent_message_id;
+    }
+    state.to_string()
 }
 
 fn restore_external_model(body: &mut Value, external_model: &str) {
@@ -1681,6 +2436,190 @@ fn apply_tool_choice_to_tool_calls(
     Ok(tool_calls)
 }
 
+fn combined_tool_parse_text(reasoning: Option<&str>, model_text: &str) -> String {
+    match reasoning.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(reasoning) if !model_text.trim().is_empty() => {
+            format!("{reasoning}\n\n{model_text}")
+        }
+        Some(reasoning) => reasoning.to_string(),
+        None => model_text.to_string(),
+    }
+}
+
+fn clean_model_visible_text(text: &str) -> String {
+    let mut value = text.trim_end();
+    loop {
+        let Some(stripped) = value.strip_suffix("FINISHED") else {
+            break;
+        };
+        value = stripped.trim_end();
+    }
+    value.to_string()
+}
+
+fn fallback_tool_call_if_needed(
+    request: &UnifiedRequest,
+    model_text: &str,
+    tool_calls: Vec<ParsedToolCall>,
+) -> Result<Vec<ParsedToolCall>, AdapterError> {
+    if !tool_calls.is_empty() || !request.tool_choice.allows_tools() {
+        return Ok(tool_calls);
+    }
+    if request.tool_choice.requires_tool() {
+        return Ok(tool_calls);
+    }
+    let Some(tool_name) = preferred_inspection_tool(request) else {
+        return Ok(tool_calls);
+    };
+    let latest_user_text = latest_user_text(request);
+    if !looks_like_explicit_project_inspection_request(&latest_user_text) {
+        return Ok(tool_calls);
+    }
+
+    tracing::warn!(
+        tool = %tool_name,
+        latest_user_chars = latest_user_text.chars().count(),
+        model_text = %truncate_for_log(model_text, 160),
+        "upstream returned an inspection preamble without a tool call; synthesizing adapter tool call"
+    );
+    Ok(vec![ParsedToolCall {
+        id: "call_adapter_inspect_1".to_string(),
+        name: tool_name.to_string(),
+        arguments: inspection_tool_arguments(tool_name).to_string(),
+    }])
+}
+
+fn immediate_tool_response_if_needed(request: &UnifiedRequest) -> Option<Value> {
+    if !request.tool_choice.allows_tools()
+        || request.tool_choice.requires_tool()
+        || has_recent_tool_result(request)
+    {
+        return None;
+    }
+    let latest_user_text = latest_user_text(request);
+    if !looks_like_explicit_project_inspection_request(&latest_user_text) {
+        return None;
+    }
+    let tool_name = preferred_inspection_tool(request)?;
+    let call = ParsedToolCall {
+        id: "call_adapter_inspect_1".to_string(),
+        name: tool_name.to_string(),
+        arguments: inspection_tool_arguments(tool_name).to_string(),
+    };
+    tracing::info!(
+        tool = %call.name,
+        latest_user_chars = latest_user_text.chars().count(),
+        "synthesizing immediate inspection tool call before upstream request"
+    );
+    Some(responses::response_from_output(
+        request,
+        responses::function_call_items(&[call]),
+        "",
+    ))
+}
+
+fn should_buffer_text_until_tool_decision(request: &UnifiedRequest) -> bool {
+    request.tool_choice.allows_tools() && !request.tools.is_empty()
+}
+
+fn has_recent_tool_result(request: &UnifiedRequest) -> bool {
+    request.messages.iter().rev().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|content| matches!(content, crate::types::UnifiedContent::ToolResult { .. }))
+    })
+}
+
+fn preferred_inspection_tool(request: &UnifiedRequest) -> Option<&str> {
+    let names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    ["exec_command", "shell", "bash", "run_command", "terminal"]
+        .into_iter()
+        .find(|candidate| names.iter().any(|name| name == candidate))
+        .or_else(|| names.first().copied())
+}
+
+fn inspection_tool_arguments(tool_name: &str) -> Value {
+    match tool_name {
+        "exec_command" | "shell" | "bash" | "run_command" | "terminal" => {
+            json!({ "cmd": "pwd && printf '\\n--- files ---\\n' && find . -maxdepth 2 -type f | sed 's#^./##' | sort | head -200 && printf '\\n--- cargo ---\\n' && sed -n '1,220p' Cargo.toml 2>/dev/null && printf '\\n--- readme ---\\n' && sed -n '1,220p' README.md 2>/dev/null && printf '\\n--- src ---\\n' && find src -maxdepth 2 -type f | sort" })
+        }
+        _ => json!({}),
+    }
+}
+
+fn latest_user_text(request: &UnifiedRequest) -> String {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content_text())
+        .unwrap_or_default()
+}
+
+fn looks_like_explicit_project_inspection_request(text: &str) -> bool {
+    let value = text.to_lowercase();
+    let normalized = value.trim();
+    if normalized.chars().count() < 8 {
+        return false;
+    }
+    if looks_like_followup_or_execution_request(normalized) {
+        return false;
+    }
+    let project_terms = [
+        "当前项目",
+        "这个项目",
+        "项目",
+        "代码",
+        "仓库",
+        "repo",
+        "repository",
+        "codebase",
+    ];
+    let inspection_terms = [
+        "看看", "看下", "检查", "分析", "问题", "结构", "质量", "review", "inspect", "check",
+        "analyze",
+    ];
+    project_terms.iter().any(|term| value.contains(term))
+        && inspection_terms.iter().any(|term| value.contains(term))
+}
+
+fn looks_like_followup_or_execution_request(text: &str) -> bool {
+    let normalized = text.trim();
+    [
+        "继续",
+        "继续开始",
+        "开始完善",
+        "执行计划",
+        "按计划",
+        "开始实现",
+        "继续实现",
+        "继续补全",
+        "接着",
+        "go on",
+        "continue",
+        "proceed",
+        "implement",
+    ]
+    .iter()
+    .any(|term| normalized.starts_with(term))
+}
+
+fn truncate_for_log(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 fn constrain_parallel_tool_calls(
     request: &UnifiedRequest,
     tool_calls: Vec<crate::types::ParsedToolCall>,
@@ -1707,9 +2646,34 @@ fn prepend_previous_response_context(
                 "previous response {previous_response_id} not found"
             ))
         })?;
+    let before_messages = request.messages.len();
+    let before_chars: usize = request
+        .messages
+        .iter()
+        .map(|message| message.content_text().chars().count())
+        .sum();
+    let previous_item_types = previous_items
+        .iter()
+        .filter_map(|item| item.get("type").and_then(|value| value.as_str()))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
     let mut previous_messages = responses::parse_input(&Value::Array(previous_items));
     previous_messages.append(&mut request.messages);
     request.messages = previous_messages;
+    let after_chars: usize = request
+        .messages
+        .iter()
+        .map(|message| message.content_text().chars().count())
+        .sum();
+    tracing::info!(
+        previous_response_id,
+        previous_item_types = ?previous_item_types,
+        before_messages,
+        after_messages = request.messages.len(),
+        before_chars,
+        after_chars,
+        "prepended previous response context"
+    );
     Ok(())
 }
 
@@ -1741,16 +2705,23 @@ fn header_string(headers: &HeaderMap, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use axum::http::HeaderMap;
     use serde_json::json;
 
     use super::{
-        apply_tool_choice_to_tool_calls, codex_managed_provider_block, codex_managed_root_block,
-        find_deepseek_bearer, replace_codex_managed_blocks, should_route_to_default_deepseek_model,
-        upstream_options_from_headers,
+        adapter_conversation_key, apply_tool_choice_to_tool_calls, clean_model_visible_text,
+        codex_managed_provider_block, codex_managed_root_block, combined_tool_parse_text,
+        fallback_tool_call_if_needed, find_deepseek_bearer, immediate_tool_response_if_needed,
+        inspection_tool_arguments, prepend_reasoning_item, replace_codex_managed_blocks,
+        should_buffer_text_until_tool_decision, should_route_to_default_deepseek_model,
+        try_mark_provider_run_active, upstream_options_from_headers,
     };
+    use crate::protocol::parse_tool_calls;
     use crate::types::{ParsedToolCall, ToolChoice, UnifiedRequest};
     use crate::upstream::UpstreamRequestOptions;
+    use crate::wire::responses;
 
     #[test]
     fn extracts_per_request_upstream_options() {
@@ -1860,5 +2831,201 @@ name = "MyOpenAI"
             "qwen3-coder",
             &options
         ));
+    }
+
+    #[test]
+    fn derives_adapter_conversation_key_from_prompt_cache_key() {
+        let key = adapter_conversation_key(&json!({
+            "prompt_cache_key": "codex-thread-a",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]
+        }));
+
+        assert_eq!(key.as_deref(), Some("prompt_cache_key:codex-thread-a"));
+    }
+
+    #[test]
+    fn derives_adapter_conversation_key_from_first_user_message() {
+        let a = adapter_conversation_key(&json!({
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"分析当前项目"}]}]
+        }));
+        let b = adapter_conversation_key(&json!({
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"分析当前项目"}]},
+                {"type":"function_call_output","call_id":"call_a","output":"ok"}
+            ]
+        }));
+
+        assert_eq!(a, b);
+        assert!(a.unwrap().starts_with("first_user:"));
+    }
+
+    #[test]
+    fn provider_run_guard_rejects_duplicate_active_conversation() {
+        let mut active = HashSet::new();
+
+        assert!(try_mark_provider_run_active(&mut active, "conv-a"));
+        assert!(!try_mark_provider_run_active(&mut active, "conv-a"));
+        assert!(try_mark_provider_run_active(&mut active, "conv-b"));
+    }
+
+    #[test]
+    fn prepends_same_reasoning_item_for_streaming_completion() {
+        let reasoning_item = responses::reasoning_output_item("thinking");
+        let reasoning_id = reasoning_item["id"].clone();
+        let output = prepend_reasoning_item(
+            Some(reasoning_item),
+            vec![responses::message_output_item("answer")],
+        );
+
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["id"], reasoning_id);
+        assert_eq!(output[1]["type"], "message");
+    }
+
+    #[test]
+    fn parses_tool_calls_from_reasoning_when_visible_text_is_plain() {
+        let text = combined_tool_parse_text(
+            Some(r#"<tool_call id="call_a" name="exec_command">{"cmd":"ls"}</tool_call>"#),
+            "我会先查看项目。",
+        );
+        let calls = parse_tool_calls(&text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+    }
+
+    #[test]
+    fn strips_deepseek_finished_sentinel_from_visible_text() {
+        assert_eq!(
+            clean_model_visible_text("正在检查项目。\nFINISHEDFINISHED"),
+            "正在检查项目。"
+        );
+    }
+
+    #[test]
+    fn synthesizes_inspection_tool_call_for_explicit_project_request() {
+        let request = UnifiedRequest {
+            model: "m".to_string(),
+            max_tokens: 16,
+            system: None,
+            messages: vec![crate::types::UnifiedMessage::text(
+                "user",
+                "你看看当前项目有哪些问题",
+            )],
+            tools: vec![crate::types::ToolDefinition {
+                name: "exec_command".to_string(),
+                description: Some("Run command".to_string()),
+                input_schema: json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: false,
+            stream: false,
+            background: false,
+            previous_response_id: None,
+        };
+
+        let calls =
+            fallback_tool_call_if_needed(&request, "正在查看项目结构和代码质量。", Vec::new())
+                .unwrap();
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+        assert!(calls[0].arguments.contains("pwd"));
+        assert!(calls[0].arguments.contains("Cargo.toml"));
+        assert!(calls[0].arguments.contains("README.md"));
+    }
+
+    #[test]
+    fn project_inspection_command_collects_actionable_context() {
+        let args = inspection_tool_arguments("exec_command");
+        let cmd = args["cmd"].as_str().unwrap();
+
+        assert!(cmd.contains("find . -maxdepth 2"));
+        assert!(cmd.contains("sed -n '1,220p' Cargo.toml"));
+        assert!(cmd.contains("find src -maxdepth 2"));
+    }
+
+    #[test]
+    fn immediately_returns_inspection_tool_call_for_project_request() {
+        let request = inspection_request(vec![crate::types::UnifiedMessage::text(
+            "user",
+            "你看看当前项目有哪些问题",
+        )]);
+
+        let body = immediate_tool_response_if_needed(&request).unwrap();
+
+        assert_eq!(body["output"][0]["type"], "function_call");
+        assert_eq!(body["output"][0]["name"], "exec_command");
+        assert_eq!(body["output_text"], "");
+    }
+
+    #[test]
+    fn does_not_immediately_return_tool_call_after_tool_result() {
+        let request = inspection_request(vec![
+            crate::types::UnifiedMessage::text("user", "你看看当前项目有哪些问题"),
+            crate::types::UnifiedMessage {
+                role: "user".to_string(),
+                content: vec![crate::types::UnifiedContent::ToolResult {
+                    tool_use_id: "call_adapter_inspect_1".to_string(),
+                    content: "Cargo.toml\nsrc".to_string(),
+                    is_error: false,
+                }],
+            },
+        ]);
+
+        assert!(immediate_tool_response_if_needed(&request).is_none());
+    }
+
+    #[test]
+    fn does_not_immediately_return_tool_call_for_followup_execution_request() {
+        let request = inspection_request(vec![crate::types::UnifiedMessage::text(
+            "user",
+            "继续开始完善",
+        )]);
+
+        assert!(immediate_tool_response_if_needed(&request).is_none());
+    }
+
+    #[test]
+    fn does_not_fallback_tool_call_for_followup_execution_request() {
+        let request =
+            inspection_request(vec![crate::types::UnifiedMessage::text("user", "执行计划")]);
+
+        let calls =
+            fallback_tool_call_if_needed(&request, "我会继续按计划实现。", Vec::new()).unwrap();
+
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn buffers_text_while_tools_are_available() {
+        let mut request =
+            inspection_request(vec![crate::types::UnifiedMessage::text("user", "普通问题")]);
+
+        assert!(should_buffer_text_until_tool_decision(&request));
+        request.tool_choice = ToolChoice::None;
+        assert!(!should_buffer_text_until_tool_decision(&request));
+        request.tool_choice = ToolChoice::Auto;
+        request.tools.clear();
+        assert!(!should_buffer_text_until_tool_decision(&request));
+    }
+
+    fn inspection_request(messages: Vec<crate::types::UnifiedMessage>) -> UnifiedRequest {
+        UnifiedRequest {
+            model: "m".to_string(),
+            max_tokens: 16,
+            system: None,
+            messages,
+            tools: vec![crate::types::ToolDefinition {
+                name: "exec_command".to_string(),
+                description: Some("Run command".to_string()),
+                input_schema: json!({"type":"object"}),
+            }],
+            tool_choice: ToolChoice::Auto,
+            parallel_tool_calls: false,
+            stream: false,
+            background: false,
+            previous_response_id: None,
+        }
     }
 }

@@ -5,8 +5,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::error::AdapterError;
 
@@ -27,6 +30,20 @@ pub struct DeepSeekWebResponse {
     pub text: String,
     pub reasoning: Option<String>,
     pub session_id: String,
+    pub parent_message_id: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeepSeekStreamEvent {
+    ReasoningDelta(String),
+    TextDelta(String),
+    SessionId(String),
+    Done {
+        text: String,
+        reasoning: Option<String>,
+        session_id: String,
+        parent_message_id: Option<Value>,
+    },
 }
 
 #[derive(Clone)]
@@ -36,6 +53,8 @@ pub struct DeepSeekWebClient {
     bearer: Option<String>,
     user_agent: String,
     session_key_override: Option<String>,
+    parent_message_id_override: Option<Value>,
+    runtime_session_key: String,
 }
 
 impl fmt::Debug for DeepSeekWebClient {
@@ -45,6 +64,11 @@ impl fmt::Debug for DeepSeekWebClient {
             .field("bearer", &self.bearer.as_deref().map(redact_secret))
             .field("user_agent", &self.user_agent)
             .field("session_key_override", &self.session_key_override)
+            .field(
+                "parent_message_id_override",
+                &self.parent_message_id_override,
+            )
+            .field("runtime_session_key", &self.runtime_session_key)
             .finish_non_exhaustive()
     }
 }
@@ -73,6 +97,8 @@ impl DeepSeekWebClient {
                 .user_agent
                 .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string()),
             session_key_override: options.last_session_id.filter(|id| !id.trim().is_empty()),
+            parent_message_id_override: options.last_parent_message_id,
+            runtime_session_key: format!("new-{}", Uuid::new_v4()),
         }
     }
 
@@ -82,18 +108,7 @@ impl DeepSeekWebClient {
         prompt: &str,
     ) -> Result<DeepSeekWebResponse, AdapterError> {
         let session_state = self.get_session_state().await?;
-        let thinking_enabled = model.contains("reasoner") || model.contains("thinking");
-        let search_enabled = model.contains("search");
-        let payload = json!({
-            "chat_session_id": session_state.session_id,
-            "parent_message_id": session_state.parent_message_id,
-            "model_type": deepseek_model_type(model),
-            "prompt": truncate_to_bytes(prompt, 32 * 1024),
-            "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "search_enabled": search_enabled,
-            "preempt": false,
-        });
+        let payload = completion_payload(model, prompt, &session_state);
 
         let response = self.post_raw("/api/v0/chat/completion", &payload).await?;
         let text = response
@@ -124,7 +139,80 @@ impl DeepSeekWebClient {
             text: output,
             reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string()),
             session_id: session_state.session_id,
+            parent_message_id: self.current_parent_message_id(),
         })
+    }
+
+    pub async fn complete_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+    ) -> Result<mpsc::Receiver<Result<DeepSeekStreamEvent, AdapterError>>, AdapterError> {
+        let session_state = self.get_session_state().await?;
+        let payload = completion_payload(model, prompt, &session_state);
+        let response = self.post_raw("/api/v0/chat/completion", &payload).await?;
+        let mut bytes = response.bytes_stream();
+        let client = self.clone();
+        let session_id = session_state.session_id.clone();
+        let (tx, rx) = mpsc::channel(128);
+        tokio::spawn(async move {
+            let mut buffer = String::new();
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut last_fragment_kind = None;
+            let mut parent_message_id = session_state.parent_message_id.clone();
+
+            while let Some(chunk) = bytes.next().await {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(AdapterError::Upstream(format!(
+                                "deepseek web stream: {error}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                drain_deepseek_stream_lines(
+                    &client,
+                    &tx,
+                    &mut buffer,
+                    &mut text,
+                    &mut reasoning,
+                    &mut last_fragment_kind,
+                    &mut parent_message_id,
+                )
+                .await;
+            }
+
+            if !buffer.trim().is_empty() {
+                let mut line = String::new();
+                std::mem::swap(&mut line, &mut buffer);
+                process_deepseek_stream_line(
+                    &client,
+                    &tx,
+                    &line,
+                    &mut text,
+                    &mut reasoning,
+                    &mut last_fragment_kind,
+                    &mut parent_message_id,
+                )
+                .await;
+            }
+
+            let parent_message_id = client.current_parent_message_id().or(parent_message_id);
+            let _ = tx
+                .send(Ok(DeepSeekStreamEvent::Done {
+                    text,
+                    reasoning: (!reasoning.trim().is_empty()).then(|| reasoning.trim().to_string()),
+                    session_id,
+                    parent_message_id,
+                }))
+                .await;
+        });
+        Ok(rx)
     }
 
     fn headers(&self) -> Result<reqwest::header::HeaderMap, AdapterError> {
@@ -178,7 +266,7 @@ impl DeepSeekWebClient {
     fn session_key(&self) -> String {
         self.session_key_override
             .clone()
-            .unwrap_or_else(|| self.cookie.clone())
+            .unwrap_or_else(|| self.runtime_session_key.clone())
     }
 
     async fn get_session_state(&self) -> Result<DeepSeekSessionState, AdapterError> {
@@ -196,7 +284,7 @@ impl DeepSeekWebClient {
         if let Some(id) = &self.session_key_override {
             let state = DeepSeekSessionState {
                 session_id: id.clone(),
-                parent_message_id: None,
+                parent_message_id: self.parent_message_id_override.clone(),
             };
             SESSION_MAP
                 .get_or_init(|| Mutex::new(HashMap::new()))
@@ -241,6 +329,16 @@ impl DeepSeekWebClient {
             .expect("DeepSeek session map poisoned")
             .insert(key, state.clone());
         Ok(state)
+    }
+
+    fn current_parent_message_id(&self) -> Option<Value> {
+        let key = self.session_key();
+        SESSION_MAP
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("DeepSeek session map poisoned")
+            .get(&key)
+            .and_then(|state| state.parent_message_id.clone())
     }
 
     fn update_parent_message_id(&self, parent_message_id: Value) {
@@ -384,6 +482,7 @@ struct DeepSeekWebOptions {
     bearer: Option<String>,
     user_agent: Option<String>,
     last_session_id: Option<String>,
+    last_parent_message_id: Option<Value>,
 }
 
 impl DeepSeekWebOptions {
@@ -393,6 +492,7 @@ impl DeepSeekWebOptions {
             bearer: None,
             user_agent: None,
             last_session_id: None,
+            last_parent_message_id: None,
         })
     }
 }
@@ -401,6 +501,83 @@ impl DeepSeekWebOptions {
 enum DeepSeekDeltaKind {
     Thinking,
     Text,
+}
+
+fn completion_payload(model: &str, prompt: &str, session_state: &DeepSeekSessionState) -> Value {
+    let thinking_enabled = model.contains("reasoner") || model.contains("thinking");
+    let search_enabled = model.contains("search");
+    json!({
+        "chat_session_id": session_state.session_id,
+        "parent_message_id": session_state.parent_message_id,
+        "model_type": deepseek_model_type(model),
+        "prompt": truncate_middle_to_bytes(prompt, 64 * 1024),
+        "ref_file_ids": [],
+        "thinking_enabled": thinking_enabled,
+        "search_enabled": search_enabled,
+        "preempt": false,
+    })
+}
+
+async fn drain_deepseek_stream_lines(
+    client: &DeepSeekWebClient,
+    tx: &mpsc::Sender<Result<DeepSeekStreamEvent, AdapterError>>,
+    buffer: &mut String,
+    text: &mut String,
+    reasoning: &mut String,
+    last_fragment_kind: &mut Option<DeepSeekDeltaKind>,
+    parent_message_id: &mut Option<Value>,
+) {
+    while let Some(index) = buffer.find('\n') {
+        let line = buffer[..index].to_string();
+        buffer.drain(..=index);
+        process_deepseek_stream_line(
+            client,
+            tx,
+            &line,
+            text,
+            reasoning,
+            last_fragment_kind,
+            parent_message_id,
+        )
+        .await;
+    }
+}
+
+async fn process_deepseek_stream_line(
+    client: &DeepSeekWebClient,
+    tx: &mpsc::Sender<Result<DeepSeekStreamEvent, AdapterError>>,
+    line: &str,
+    text: &mut String,
+    reasoning: &mut String,
+    last_fragment_kind: &mut Option<DeepSeekDeltaKind>,
+    parent_message_id: &mut Option<Value>,
+) {
+    let Some(parsed) = parse_deepseek_sse_line(line) else {
+        return;
+    };
+    if let Some(parent_id) = extract_parent_message_id(&parsed) {
+        *parent_message_id = Some(parent_id.clone());
+        client.update_parent_message_id(parent_id);
+    }
+    if let Some(session_id) = find_deepseek_session_id(&parsed) {
+        let _ = tx
+            .send(Ok(DeepSeekStreamEvent::SessionId(session_id)))
+            .await;
+    }
+    for (kind, content) in extract_deepseek_deltas(&parsed, last_fragment_kind) {
+        match kind {
+            DeepSeekDeltaKind::Thinking => {
+                reasoning.push_str(&content);
+                let _ = tx
+                    .send(Ok(DeepSeekStreamEvent::ReasoningDelta(content)))
+                    .await;
+            }
+            DeepSeekDeltaKind::Text => {
+                text.push_str(&content);
+                let _ = tx.send(Ok(DeepSeekStreamEvent::TextDelta(content))).await;
+            }
+        }
+    }
 }
 
 async fn expect_success_response(
@@ -678,25 +855,39 @@ fn deepseek_pow_response_payload(challenge: &Value, answer: Value, target_path: 
     pow_payload
 }
 
-fn truncate_to_bytes(content: &str, max_bytes: usize) -> String {
+fn truncate_middle_to_bytes(content: &str, max_bytes: usize) -> String {
     let trimmed = content.trim();
     if trimmed.len() <= max_bytes {
         return trimmed.to_string();
     }
 
-    let marker = "\n\n[truncated] deepseek web request budget";
+    let marker = "\n\n[truncated middle for deepseek web request budget]\n\n";
     let budget = max_bytes.saturating_sub(marker.len());
-    let mut end = 0;
+    let head_budget = budget / 2;
+    let tail_budget = budget.saturating_sub(head_budget);
+    let mut head_end = 0;
     for (idx, ch) in trimmed.char_indices() {
         let next = idx + ch.len_utf8();
-        if next > budget {
+        if next > head_budget {
             break;
         }
-        end = next;
+        head_end = next;
     }
 
-    let mut output = trimmed[..end].to_string();
+    let mut tail_start = trimmed.len();
+    let mut used_tail = 0;
+    for (idx, ch) in trimmed.char_indices().rev() {
+        let next = used_tail + ch.len_utf8();
+        if next > tail_budget {
+            break;
+        }
+        used_tail = next;
+        tail_start = idx;
+    }
+
+    let mut output = trimmed[..head_end].to_string();
     output.push_str(marker);
+    output.push_str(&trimmed[tail_start..]);
     output
 }
 
@@ -725,4 +916,23 @@ fn current_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_middle_to_bytes;
+
+    #[test]
+    fn deepseek_prompt_truncation_preserves_head_and_latest_user_request() {
+        let prompt = format!(
+            "<tool_protocol>must call tools</tool_protocol>\n{}\nuser: 看看当前项目有什么问题",
+            "x".repeat(10_000)
+        );
+
+        let truncated = truncate_middle_to_bytes(&prompt, 1024);
+
+        assert!(truncated.contains("<tool_protocol>must call tools</tool_protocol>"));
+        assert!(truncated.contains("[truncated middle for deepseek web request budget]"));
+        assert!(truncated.contains("user: 看看当前项目有什么问题"));
+    }
 }

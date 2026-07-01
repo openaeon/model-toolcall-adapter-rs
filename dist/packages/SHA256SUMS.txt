@@ -1,4 +1,4 @@
-2f7a12eb6a4de20c7d95293ee0797517576860526759e63417b8216a38117ed3  model-toolcall-adapter-rs-v0.2.0-linux-arm64-server.tar.gz
-052bc33e408f233bad89924f0f79617da76f94df3b23ed3f1d6f213f9bdeed8a  model-toolcall-adapter-rs-v0.2.0-linux-x64-server.tar.gz
-6aae61c2319c84984713c27fc3ff86b2567ca7b76e2f8fa64f5226f73015e957  model-toolcall-adapter-rs-v0.2.0-macos-arm64.tar.gz
-d731fe4abd399fa01548046bcb5b42166844e06b32fb9331824e4157abc21bef  model-toolcall-adapter-rs-v0.2.0-windows-x64-exe.zip
+957ba5e36177d6ada3e593343eafec29366f72d31b2d4bd8825b9f2674c1a4dc  model-toolcall-adapter-rs-v0.2.0-linux-arm64-server.tar.gz
+62ae176eade1e63d03eefb635ea5dd57ec7d9cf7bedb35de769a0dff922f4b5e  model-toolcall-adapter-rs-v0.2.0-linux-x64-server.tar.gz
+cee759f75a73680e25fd47a9130166095f10f8c98aee8b3ea1776f723f5adb0d  model-toolcall-adapter-rs-v0.2.0-macos-arm64.tar.gz
+546a35324eb66a54e248964da30b53249ffe273b643edd685f3b9091787ada02  model-toolcall-adapter-rs-v0.2.0-windows-x64-exe.zip
